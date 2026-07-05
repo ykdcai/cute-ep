@@ -303,17 +303,25 @@ def combine_kernel(
     # SYS-scope volatile loads for reading remote GPU memory via a P2P
     # pointer. `CopyUniversalOp` carries the load/store semantics via its
     # `memory_scope` / `memory_order` keyword arguments.
+    # B200 (SM100) supports 256-bit vectorized global loads/stores. Widening
+    # from 128b doubles the bytes-in-flight per outstanding remote load, which
+    # directly helps this latency-bound combine (Little's law). Derive the
+    # per-thread element count and alignment from this single width.
+    COPY_BITS = 256
+    dtype = combine_output_buf.dtype
+    elems_per_copy = COPY_BITS // dtype.width
+    copy_align = COPY_BITS // 8  # bytes; required alignment for the vector access
     copy_atom_load = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(),
-        combine_output_buf.dtype,
-        num_bits_per_copy=128,
+        dtype,
+        num_bits_per_copy=COPY_BITS,
         memory_scope=cute.nvgpu.common.MemoryScope.SYS,
         memory_order=cute.nvgpu.common.MemoryOrder.VOLATILE,
     )
     copy_atom_store = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), combine_output_buf.dtype, num_bits_per_copy=128)
-    thr_layout = cute.make_ordered_layout((1, 32), order=(1, 0))
-    val_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
+        cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=COPY_BITS)
+    thr_layout = cute.make_ordered_layout((1, WARP_SIZE), order=(1, 0))
+    val_layout = cute.make_ordered_layout((1, elems_per_copy), order=(1, 0))
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
     tiled_copy_store = cute.make_tiled_copy_tv(copy_atom_store, thr_layout, val_layout)
     copy_idx = tidx % WARP_SIZE
@@ -324,35 +332,45 @@ def combine_kernel(
 
     # Partition output for stores
     output_layout = cute.make_ordered_layout((num_tokens, hidden_size), order=(1, 0))
-    output_tensor = cute.make_tensor(combine_output_buf.align(16), output_layout)
+    output_tensor = cute.make_tensor(combine_output_buf.align(copy_align), output_layout)
     tDgD = thr_copy_store.partition_D(output_tensor)
-    tSrS = cute.make_fragment_like(tDgD[None, 0, 0])
     accum = cute.make_fragment_like(tDgD[None, 0, 0])
+    # One register fragment per topk expert so all topk remote loads can be
+    # issued before any is consumed (memory-level parallelism to hide the
+    # NVLink read round-trip; see Little's law).
+    frgs = [cute.make_fragment_like(tDgD[None, 0, 0]) for _ in range(topk)]
     hidden_iter = cute.size(tDgD, mode=[2])
 
     remote_layout = cute.make_ordered_layout((max_tokens, hidden_size), order=(1, 0))
 
     for token_offset in range(global_warp_id, num_tokens, total_warps):
+        # Hoist the per-(token, j) remote addressing out of the hidden loop:
+        # expert_rank / scatter_idx / partition depend only on (token, j), so
+        # compute them topk times per token instead of hidden_iter * topk.
+        remote_slices = []
+        for j in cutlass.range_constexpr(topk):
+            expert_idx = topk_indices_tensor[token_offset, j]
+            expert_rank = expert_idx // experts_per_rank
+            scatter_idx = token_dst_scatter_idx[token_offset, j]
+            # expert_rank's expert_output_buf, addressed as a local pointer.
+            remote_ptr = cute.make_ptr(
+                dtype,
+                expert_output_peer_ptrs[expert_rank],
+                cute.AddressSpace.gmem,
+                assumed_align=copy_align,
+            )
+            remote_tensor = cute.make_tensor(remote_ptr, remote_layout)
+            tSgS_remote = thr_copy_load.partition_S(remote_tensor)
+            remote_slices.append((tSgS_remote, scatter_idx))
+
         for k in range(hidden_iter):
+            # Issue all topk remote loads first (in flight), then reduce.
+            for j in cutlass.range_constexpr(topk):
+                tSgS_remote, scatter_idx = remote_slices[j]
+                cute.copy(thr_copy_load, tSgS_remote[None, scatter_idx, k], frgs[j])
             accum.fill(0.0)
             for j in cutlass.range_constexpr(topk):
-                expert_idx = topk_indices_tensor[token_offset, j]
-                expert_rank = expert_idx // experts_per_rank
-                scatter_idx = token_dst_scatter_idx[token_offset, j]
-
-                # expert_rank's expert_output_buf, addressed as a local pointer.
-                remote_ptr = cute.make_ptr(
-                    combine_output_buf.dtype,
-                    expert_output_peer_ptrs[expert_rank],
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                remote_tensor = cute.make_tensor(remote_ptr, remote_layout)
-                tSgS_remote = thr_copy_load.partition_S(remote_tensor)
-
-                cute.copy(thr_copy_load, tSgS_remote[None, scatter_idx, k], tSrS)
-                accum.store(accum.load() + tSrS.load())
-
+                accum.store(accum.load() + frgs[j].load())
             cute.copy(thr_copy_store, accum, tDgD[None, token_offset, k])
 
 
