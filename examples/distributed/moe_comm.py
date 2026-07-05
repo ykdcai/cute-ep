@@ -32,8 +32,11 @@ import functools
 import numpy as np
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cute_utils
+import cutlass.pipeline as pipeline
 import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import Int32
 from cuda.core import Device
 
@@ -456,6 +459,198 @@ def combine_jit(
 
 
 # ---------------------------------------------------------------------------
+# TMA-bulk combine: SM-efficient variant.
+# ---------------------------------------------------------------------------
+# The register combine needs ~all SMs to saturate NVLink because per-thread
+# LD.256 reads keep too few bytes in flight per SM (MSHR-limited). TMA bulk
+# copies whole hidden chunks (peer GMEM -> SMEM) via the copy engine, so a
+# single producer warp can keep topk * chunk_bytes in flight from one CTA,
+# letting a handful of SMs saturate the link (DeepEP-style). This frees the
+# rest of the GPU for the expert GEMMs (comm/compute overlap).
+#
+# Gather addressing: each peer's expert_output_buf is flattened to 1D and
+# tiled by HCHUNK. Expert row `slot` chunk `k` on any peer is tile
+# `slot * num_chunks + k` (row-major), a runtime tile id. The owning rank is
+# picked by a small constexpr branch over world_size descriptors.
+def _per_thread_view(tile_1d, vec_size, consumer_threads, ctid):
+    # (HCHUNK,) -> this consumer thread's ((vec,), (1,)) strided slice.
+    # Split into groups of vec_size*consumer_threads, then each group into
+    # per-thread vec_size chunks; slice out column ctid.
+    by_vec = cute.logical_divide(
+        cute.zipped_divide(tile_1d, (vec_size * consumer_threads,)),
+        (vec_size,))
+    return cute.slice_(by_vec, ((None, ctid), None))
+
+
+class CombineTmaKernel:
+    HCHUNK: int = 3584       # hidden elems per TMA tile (must divide hidden)
+    NUM_STAGES: int = 8      # smem pipeline depth (>= topk for full overlap)
+    TMA_THREADS: int = 32    # warp 0 = producer
+    CONSUMER_THREADS: int = 128
+
+    def __init__(self, dtype, hidden, topk):
+        self.dtype = dtype
+        assert hidden % self.HCHUNK == 0, f"hidden {hidden} not divisible by {self.HCHUNK}"
+        self.num_chunks = hidden // self.HCHUNK
+        self.topk = topk
+        self.vec_size = self.HCHUNK // self.CONSUMER_THREADS
+        self.threads_per_cta = self.TMA_THREADS + self.CONSUMER_THREADS
+        self.tma_bytes = (dtype.width // 8) * self.HCHUNK
+
+        elems = self.HCHUNK
+        stages = self.NUM_STAGES
+
+        @cute.struct
+        class SharedStorage:
+            mbar_array: cute.struct.MemRange[cutlass.Int64, stages * 2]
+            smem_buffer: cute.struct.Align[
+                cute.struct.MemRange[dtype, elems * stages], 128
+            ]
+
+        self._SharedStorage = SharedStorage
+
+    @cute.jit
+    def __call__(
+        self,
+        peer_tensors: list[cute.Tensor],   # world_size x [max_tokens, hidden]
+        output_tensor: cute.Tensor,        # local [num_tokens, hidden]
+        topk_indices: cute.Tensor,         # [num_tokens, topk] int32
+        scatter_idx: cute.Tensor,          # [num_tokens, topk] int32
+        num_input_tokens: cute.Tensor,     # [world_size] int32
+        experts_per_rank: cutlass.Constexpr,
+        local_rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
+        cta_nums: cutlass.Constexpr,
+    ):
+        smem_layout = cute.make_layout((self.HCHUNK,))
+        tiler = (self.HCHUNK,)
+        tma_op = cpasync.CopyBulkTensorTileG2SOp()
+        tma_atoms = []
+        tma_tensors = []
+        for i in cutlass.range_constexpr(world_size):
+            total = cute.size(peer_tensors[i].layout)
+            flat = cute.make_tensor(peer_tensors[i].iterator, cute.make_layout((total,)))
+            atom, tensor = cpasync.make_tiled_tma_atom(tma_op, flat, smem_layout, tiler)
+            tma_atoms.append(atom)
+            tma_tensors.append(tensor)
+
+        out_total = cute.size(output_tensor.layout)
+        out_flat = cute.make_tensor(output_tensor.iterator, cute.make_layout((out_total,)))
+
+        self.kernel(
+            tma_atoms, tma_tensors, out_flat,
+            topk_indices, scatter_idx, num_input_tokens,
+            experts_per_rank, local_rank, world_size, cta_nums,
+        ).launch(
+            grid=[cta_nums, 1, 1],
+            block=[self.threads_per_cta, 1, 1],
+            smem=self._SharedStorage.size_in_bytes(),
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tma_atoms: list[cute.CopyAtom],
+        tma_tensors: list[cute.Tensor],
+        out_flat: cute.Tensor,
+        topk_indices: cute.Tensor,
+        scatter_idx: cute.Tensor,
+        num_input_tokens: cute.Tensor,
+        experts_per_rank: cutlass.Constexpr,
+        local_rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
+        cta_nums: cutlass.Constexpr,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        bidx = cute.arch.block_idx()[0]
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        topk = cutlass.const_expr(self.topk)
+        num_chunks = cutlass.const_expr(self.num_chunks)
+        HCHUNK = cutlass.const_expr(self.HCHUNK)
+        vec_size = cutlass.const_expr(self.vec_size)
+        tiler = (HCHUNK,)
+
+        smem = cute_utils.SmemAllocator()
+        storage = smem.allocate(self._SharedStorage)
+        mbar_ptr = storage.mbar_array.data_ptr()
+        staged = storage.smem_buffer.get_tensor(
+            cute.make_layout((HCHUNK, self.NUM_STAGES)))
+
+        tma_pipeline = pipeline.PipelineTmaAsync.create(
+            barrier_storage=mbar_ptr,
+            num_stages=self.NUM_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.CONSUMER_THREADS),
+            tx_count=self.tma_bytes,
+            cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+        )
+
+        num_tokens = num_input_tokens[local_rank]
+
+        if warp_idx == 0:
+            # Producer: stream topk chunks per token into smem via TMA.
+            prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.NUM_STAGES)
+            token = bidx
+            while token < num_tokens:
+                for k in cutlass.range_constexpr(num_chunks):
+                    for j in cutlass.range_constexpr(topk):
+                        expert_idx = topk_indices[token, j]
+                        rank_j = expert_idx // experts_per_rank
+                        slot_j = scatter_idx[token, j]
+                        tile_id = slot_j * num_chunks + k
+                        tma_pipeline.producer_acquire(prod)
+                        s_tile = cute.slice_(staged, (None, prod.index))
+                        s_flat = cute.group_modes(s_tile, 0, cute.rank(s_tile))
+                        for r in cutlass.range_constexpr(world_size):
+                            if rank_j == r:
+                                g_tiled = cute.zipped_divide(tma_tensors[r], tiler)
+                                g_tile = g_tiled[(None,), tile_id]
+                                g_flat = cute.group_modes(g_tile, 0, cute.rank(g_tile))
+                                s_part, g_part = cpasync.tma_partition(
+                                    tma_atoms[r], 0, cute.make_layout(1), s_flat, g_flat)
+                                cute.copy(
+                                    tma_atoms[r], g_part, s_part,
+                                    tma_bar_ptr=tma_pipeline.producer_get_barrier(prod))
+                        tma_pipeline.producer_commit(prod)
+                        prod.advance()
+                token += cta_nums
+        else:
+            # Consumer: wait topk chunks, reduce, store local output row chunk.
+            ctid = tidx - self.TMA_THREADS
+            CONSUMER_THREADS = cutlass.const_expr(self.CONSUMER_THREADS)
+            cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.NUM_STAGES)
+
+            out_tiled = cute.zipped_divide(out_flat, tiler)
+            token = bidx
+            while token < num_tokens:
+                for k in cutlass.range_constexpr(num_chunks):
+                    accum = cute.make_rmem_tensor(
+                        _per_thread_view(
+                            cute.slice_(staged, (None, 0)),
+                            vec_size, CONSUMER_THREADS, ctid).layout,
+                        self.dtype)
+                    accum.fill(self.dtype(0.0))
+                    for j in cutlass.range_constexpr(topk):
+                        tma_pipeline.consumer_wait(cons)
+                        s_tile = cute.slice_(staged, (None, cons.index))
+                        accum.store(
+                            accum.load()
+                            + _per_thread_view(
+                                s_tile, vec_size, CONSUMER_THREADS, ctid).load())
+                        tma_pipeline.sync_object_empty.arrive(
+                            cons.index, tma_pipeline.consumer_mask)
+                        cons.advance()
+                    out_tile = out_tiled[(None,), token * num_chunks + k]
+                    _per_thread_view(
+                        out_tile, vec_size, CONSUMER_THREADS, ctid).store(accum.load())
+                token += cta_nums
+
+
+# ---------------------------------------------------------------------------
 # Peer-pointer helper: map an NVSHMEM symmetric tensor to each rank's base
 # address so kernels can address remote buffers as plain local pointers.
 # ---------------------------------------------------------------------------
@@ -631,7 +826,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                              benchmark=False, warmup_iterations=10,
                              iterations=100, save_baseline_to=None,
                              bench_only="both",
-                             combine_cta_nums=148, combine_num_warps=32):
+                             combine_cta_nums=148, combine_num_warps=32,
+                             combine_impl="reg"):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     experts_per_rank = num_experts // world_size
@@ -875,26 +1071,34 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     ntok_cute = from_dlpack(num_input_tokens_per_rank)
 
     if rank == 0:
-        print("Compiling combine kernel...")
-    compiled_combine = _compile_kernel(
-        combine_jit,
-        expert_output_peer_cute, combine_cute,
-        topk_idx_cute, scatter_cute,
-        ntok_cute, max_recv_tokens, hidden,
-        topk, experts_per_rank, rank,
-        combine_cta_nums, combine_num_warps,
-    )
+        print(f"Compiling combine kernel ({combine_impl})...")
+    if combine_impl == "tma":
+        # TMA path takes peer output tensors directly (descriptors built
+        # host-side from each peer's buffer); config is baked as constexpr.
+        peer_output_tensors = [
+            from_dlpack(nvshmem.core.get_peer_tensor(output_buf, r))
+            for r in range(world_size)]
+        tma_kernel = CombineTmaKernel(cutlass.Float32, hidden, topk)
+        combine_run_args = (
+            peer_output_tensors, combine_cute,
+            topk_idx_cute, scatter_cute, ntok_cute)
+        compiled_combine = cute.compile(
+            tma_kernel, *combine_run_args,
+            experts_per_rank, rank, world_size, combine_cta_nums)
+    else:
+        combine_run_args = (
+            expert_output_peer_cute, combine_cute,
+            topk_idx_cute, scatter_cute, ntok_cute, max_recv_tokens, hidden)
+        compiled_combine = _compile_kernel(
+            combine_jit, *combine_run_args,
+            topk, experts_per_rank, rank, combine_cta_nums, combine_num_warps)
 
     torch.cuda.synchronize()
     dist.barrier()
 
     if rank == 0:
         print("Running combine kernel...")
-    compiled_combine(
-        expert_output_peer_cute, combine_cute,
-        topk_idx_cute, scatter_cute,
-        ntok_cute, max_recv_tokens, hidden,
-    )
+    compiled_combine(*combine_run_args)
 
     torch.cuda.synchronize()
     nvshmem_stream = Device().create_stream()
@@ -1056,19 +1260,27 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
 
         combine_output_buf2 = torch.zeros(
             (num_tokens, hidden), dtype=torch.float32, device=device)
-        expert_output_peer_cute = from_dlpack(
-            _peer_ptr_tensor(output_buf, world_size, device))
         combine_cute2 = from_dlpack(combine_output_buf2)
 
         dispatch_args = (
             input_cute, output_peer_cute, topk_idx_cute, scatter_cute,
             recv_dummy_cute, ntok_cute, max_recv_tokens, hidden, topk,
         )
-        combine_args = (
-            expert_output_peer_cute, combine_cute2,
-            topk_idx_cute, scatter_cute,
-            ntok_cute, max_recv_tokens, hidden,
-        )
+        if combine_impl == "tma":
+            peer_output_tensors = [
+                from_dlpack(nvshmem.core.get_peer_tensor(output_buf, r))
+                for r in range(world_size)]
+            combine_args = (
+                peer_output_tensors, combine_cute2,
+                topk_idx_cute, scatter_cute, ntok_cute)
+        else:
+            expert_output_peer_cute = from_dlpack(
+                _peer_ptr_tensor(output_buf, world_size, device))
+            combine_args = (
+                expert_output_peer_cute, combine_cute2,
+                topk_idx_cute, scatter_cute,
+                ntok_cute, max_recv_tokens, hidden,
+            )
         run_moe_benchmark(
             compiled_scatter, compiled_combine,
             dispatch_args, combine_args,
@@ -1153,7 +1365,8 @@ def run_moe_benchmark(compiled_dispatch, compiled_combine,
 
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
         warmup_iterations=10, iterations=100, save_baseline_to=None,
-        bench_only="both", combine_cta_nums=148, combine_num_warps=32):
+        bench_only="both", combine_cta_nums=148, combine_num_warps=32,
+        combine_impl="reg"):
     torchrun_uid_init_bcast()
     try:
         run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
@@ -1163,7 +1376,8 @@ def run(num_tokens, hidden, num_experts, topk, benchmark=False,
                                  save_baseline_to=save_baseline_to,
                                  bench_only=bench_only,
                                  combine_cta_nums=combine_cta_nums,
-                                 combine_num_warps=combine_num_warps)
+                                 combine_num_warps=combine_num_warps,
+                                 combine_impl=combine_impl)
     finally:
         _finalize_kernels()
         torchrun_finalize()
@@ -1190,6 +1404,10 @@ def main():
     parser.add_argument("--combine-num-warps", default=32, type=int,
                         help="Warps per combine CTA (block = num_warps * 32). "
                              "148 CTAs x 32 warps = 2 CTAs/SM = full occupancy.")
+    parser.add_argument("--combine-impl", default="reg",
+                        choices=["reg", "tma"],
+                        help="Combine implementation: 'reg' (register LD.256) or "
+                             "'tma' (SM-efficient TMA-bulk peer->smem).")
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--save-baseline-to", default=None,
@@ -1207,7 +1425,8 @@ def main():
         save_baseline_to=args.save_baseline_to,
         bench_only=args.bench_only,
         combine_cta_nums=args.combine_cta_nums,
-        combine_num_warps=args.combine_num_warps)
+        combine_num_warps=args.combine_num_warps,
+        combine_impl=args.combine_impl)
 
 
 if __name__ == "__main__":
