@@ -483,22 +483,29 @@ def _per_thread_view(tile_1d, vec_size, consumer_threads, ctid):
 
 
 class CombineTmaKernel:
-    HCHUNK: int = 3584       # hidden elems per TMA tile (must divide hidden)
-    NUM_STAGES: int = 8      # smem pipeline depth (>= topk for full overlap)
-    TMA_THREADS: int = 32    # warp 0 = producer
-    CONSUMER_THREADS: int = 128
-
-    def __init__(self, dtype, hidden, topk):
+    # All knobs are constructor args (below) so the kernel is autotunable.
+    # Defaults chosen for hidden=7168 fp32 on B200.
+    def __init__(self, dtype, hidden, topk,
+                 hchunk: int = 3584,      # hidden elems per bulk tile (must divide hidden)
+                 num_stages: int = 8,     # smem pipeline depth (>= topk for full overlap)
+                 tma_threads: int = 32,   # producer warp(s); only 1 thread issues
+                 consumer_threads: int = 128):
         self.dtype = dtype
-        assert hidden % self.HCHUNK == 0, f"hidden {hidden} not divisible by {self.HCHUNK}"
-        self.num_chunks = hidden // self.HCHUNK
+        assert hidden % hchunk == 0, f"hidden {hidden} not divisible by hchunk {hchunk}"
+        assert hchunk % consumer_threads == 0, (
+            f"hchunk {hchunk} not divisible by consumer_threads {consumer_threads}")
+        self.HCHUNK = hchunk
+        self.NUM_STAGES = num_stages
+        self.TMA_THREADS = tma_threads
+        self.CONSUMER_THREADS = consumer_threads
+        self.num_chunks = hidden // hchunk
         self.topk = topk
-        self.vec_size = self.HCHUNK // self.CONSUMER_THREADS
-        self.threads_per_cta = self.TMA_THREADS + self.CONSUMER_THREADS
-        self.tma_bytes = (dtype.width // 8) * self.HCHUNK
+        self.vec_size = hchunk // consumer_threads
+        self.threads_per_cta = tma_threads + consumer_threads
+        self.tma_bytes = (dtype.width // 8) * hchunk
 
-        elems = self.HCHUNK
-        stages = self.NUM_STAGES
+        elems = hchunk
+        stages = num_stages
 
         @cute.struct
         class SharedStorage:
@@ -522,23 +529,19 @@ class CombineTmaKernel:
         world_size: cutlass.Constexpr,
         cta_nums: cutlass.Constexpr,
     ):
-        smem_layout = cute.make_layout((self.HCHUNK,))
-        tiler = (self.HCHUNK,)
-        tma_op = cpasync.CopyBulkTensorTileG2SOp()
-        tma_atoms = []
-        tma_tensors = []
+        # Raw 1D cp.async.bulk: each peer buffer is just flattened to 1D; the
+        # producer slices a contiguous HCHUNK run by tile id. No TMA descriptor.
+        peer_flat = []
         for i in cutlass.range_constexpr(world_size):
             total = cute.size(peer_tensors[i].layout)
-            flat = cute.make_tensor(peer_tensors[i].iterator, cute.make_layout((total,)))
-            atom, tensor = cpasync.make_tiled_tma_atom(tma_op, flat, smem_layout, tiler)
-            tma_atoms.append(atom)
-            tma_tensors.append(tensor)
+            peer_flat.append(
+                cute.make_tensor(peer_tensors[i].iterator, cute.make_layout((total,))))
 
         out_total = cute.size(output_tensor.layout)
         out_flat = cute.make_tensor(output_tensor.iterator, cute.make_layout((out_total,)))
 
         self.kernel(
-            tma_atoms, tma_tensors, out_flat,
+            peer_flat, out_flat,
             topk_indices, scatter_idx, num_input_tokens,
             experts_per_rank, local_rank, world_size, cta_nums,
         ).launch(
@@ -550,8 +553,7 @@ class CombineTmaKernel:
     @cute.kernel
     def kernel(
         self,
-        tma_atoms: list[cute.CopyAtom],
-        tma_tensors: list[cute.Tensor],
+        peer_flat: list[cute.Tensor],
         out_flat: cute.Tensor,
         topk_indices: cute.Tensor,
         scatter_idx: cute.Tensor,
@@ -590,7 +592,8 @@ class CombineTmaKernel:
         num_tokens = num_input_tokens[local_rank]
 
         if warp_idx == 0:
-            # Producer: stream topk chunks per token into smem via TMA.
+            # Producer: stream topk chunks per token into smem via raw 1D bulk.
+            bulk_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), self.dtype)
             prod = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.NUM_STAGES)
             token = bidx
@@ -603,17 +606,14 @@ class CombineTmaKernel:
                         tile_id = slot_j * num_chunks + k
                         tma_pipeline.producer_acquire(prod)
                         s_tile = cute.slice_(staged, (None, prod.index))
-                        s_flat = cute.group_modes(s_tile, 0, cute.rank(s_tile))
                         for r in cutlass.range_constexpr(world_size):
                             if rank_j == r:
-                                g_tiled = cute.zipped_divide(tma_tensors[r], tiler)
+                                g_tiled = cute.zipped_divide(peer_flat[r], tiler)
                                 g_tile = g_tiled[(None,), tile_id]
-                                g_flat = cute.group_modes(g_tile, 0, cute.rank(g_tile))
-                                s_part, g_part = cpasync.tma_partition(
-                                    tma_atoms[r], 0, cute.make_layout(1), s_flat, g_flat)
-                                cute.copy(
-                                    tma_atoms[r], g_part, s_part,
-                                    tma_bar_ptr=tma_pipeline.producer_get_barrier(prod))
+                                with cute.arch.elect_one():
+                                    cute.copy(
+                                        bulk_atom, g_tile, s_tile,
+                                        mbar_ptr=tma_pipeline.producer_get_barrier(prod))
                         tma_pipeline.producer_commit(prod)
                         prod.advance()
                 token += cta_nums
@@ -827,7 +827,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                              iterations=100, save_baseline_to=None,
                              bench_only="both",
                              combine_cta_nums=148, combine_num_warps=32,
-                             combine_impl="reg"):
+                             combine_impl="reg", combine_tma_cfg=None):
+    combine_tma_cfg = combine_tma_cfg or {}
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     experts_per_rank = num_experts // world_size
@@ -1078,7 +1079,7 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         peer_output_tensors = [
             from_dlpack(nvshmem.core.get_peer_tensor(output_buf, r))
             for r in range(world_size)]
-        tma_kernel = CombineTmaKernel(cutlass.Float32, hidden, topk)
+        tma_kernel = CombineTmaKernel(cutlass.Float32, hidden, topk, **combine_tma_cfg)
         combine_run_args = (
             peer_output_tensors, combine_cute,
             topk_idx_cute, scatter_cute, ntok_cute)
@@ -1366,7 +1367,7 @@ def run_moe_benchmark(compiled_dispatch, compiled_combine,
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
         warmup_iterations=10, iterations=100, save_baseline_to=None,
         bench_only="both", combine_cta_nums=148, combine_num_warps=32,
-        combine_impl="reg"):
+        combine_impl="reg", combine_tma_cfg=None):
     torchrun_uid_init_bcast()
     try:
         run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
@@ -1377,7 +1378,8 @@ def run(num_tokens, hidden, num_experts, topk, benchmark=False,
                                  bench_only=bench_only,
                                  combine_cta_nums=combine_cta_nums,
                                  combine_num_warps=combine_num_warps,
-                                 combine_impl=combine_impl)
+                                 combine_impl=combine_impl,
+                                 combine_tma_cfg=combine_tma_cfg)
     finally:
         _finalize_kernels()
         torchrun_finalize()
@@ -1408,6 +1410,15 @@ def main():
                         choices=["reg", "tma"],
                         help="Combine implementation: 'reg' (register LD.256) or "
                              "'tma' (SM-efficient TMA-bulk peer->smem).")
+    # Autotunable TMA-combine knobs (only used when --combine-impl tma).
+    parser.add_argument("--tma-hchunk", default=3584, type=int,
+                        help="Hidden elems per bulk tile (must divide hidden).")
+    parser.add_argument("--tma-stages", default=8, type=int,
+                        help="Smem pipeline depth (>= topk for full overlap).")
+    parser.add_argument("--tma-producer-threads", default=32, type=int,
+                        help="Producer threads per CTA (only 1 issues the bulk copy).")
+    parser.add_argument("--tma-consumer-threads", default=128, type=int,
+                        help="Consumer threads per CTA (must divide hchunk).")
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--save-baseline-to", default=None,
@@ -1426,7 +1437,13 @@ def main():
         bench_only=args.bench_only,
         combine_cta_nums=args.combine_cta_nums,
         combine_num_warps=args.combine_num_warps,
-        combine_impl=args.combine_impl)
+        combine_impl=args.combine_impl,
+        combine_tma_cfg=dict(
+            hchunk=args.tma_hchunk,
+            num_stages=args.tma_stages,
+            tma_threads=args.tma_producer_threads,
+            consumer_threads=args.tma_consumer_threads,
+        ))
 
 
 if __name__ == "__main__":
