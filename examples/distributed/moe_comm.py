@@ -431,11 +431,12 @@ def combine_jit(
     topk: cutlass.Constexpr,
     experts_per_rank: cutlass.Constexpr,
     local_rank: cutlass.Constexpr,
+    cta_nums: cutlass.Constexpr,
+    num_warps: cutlass.Constexpr,
 ):
-
-    num_warps = 32
-    cta_nums = 20
-
+    # Combine is remote-read bound; unlike write-bound dispatch it needs many
+    # SMs active to have enough outstanding read requests (MSHRs are per-SM),
+    # so cta_nums / num_warps are tunable (see --combine-cta-nums / -num-warps).
     combine_kernel(
         expert_output_peer_ptrs,
         combine_output_buf.iterator,
@@ -629,7 +630,8 @@ def check_combine(combine_output, expert_output_buf, topk_indices,
 def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                              benchmark=False, warmup_iterations=10,
                              iterations=100, save_baseline_to=None,
-                             bench_only="both"):
+                             bench_only="both",
+                             combine_cta_nums=148, combine_num_warps=32):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     experts_per_rank = num_experts // world_size
@@ -880,6 +882,7 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         topk_idx_cute, scatter_cute,
         ntok_cute, max_recv_tokens, hidden,
         topk, experts_per_rank, rank,
+        combine_cta_nums, combine_num_warps,
     )
 
     torch.cuda.synchronize()
@@ -1150,7 +1153,7 @@ def run_moe_benchmark(compiled_dispatch, compiled_combine,
 
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
         warmup_iterations=10, iterations=100, save_baseline_to=None,
-        bench_only="both"):
+        bench_only="both", combine_cta_nums=148, combine_num_warps=32):
     torchrun_uid_init_bcast()
     try:
         run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
@@ -1158,7 +1161,9 @@ def run(num_tokens, hidden, num_experts, topk, benchmark=False,
                                  warmup_iterations=warmup_iterations,
                                  iterations=iterations,
                                  save_baseline_to=save_baseline_to,
-                                 bench_only=bench_only)
+                                 bench_only=bench_only,
+                                 combine_cta_nums=combine_cta_nums,
+                                 combine_num_warps=combine_num_warps)
     finally:
         _finalize_kernels()
         torchrun_finalize()
@@ -1179,6 +1184,12 @@ def main():
                         choices=["both", "dispatch", "combine"],
                         help="Benchmark only the dispatch or combine kernel "
                              "(default: both)")
+    parser.add_argument("--combine-cta-nums", default=148, type=int,
+                        help="Combine grid size (CTAs). Read-bound, so covering "
+                             "all SMs matters (B200 has 148).")
+    parser.add_argument("--combine-num-warps", default=32, type=int,
+                        help="Warps per combine CTA (block = num_warps * 32). "
+                             "148 CTAs x 32 warps = 2 CTAs/SM = full occupancy.")
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--save-baseline-to", default=None,
@@ -1194,7 +1205,9 @@ def main():
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
         save_baseline_to=args.save_baseline_to,
-        bench_only=args.bench_only)
+        bench_only=args.bench_only,
+        combine_cta_nums=args.combine_cta_nums,
+        combine_num_warps=args.combine_num_warps)
 
 
 if __name__ == "__main__":
