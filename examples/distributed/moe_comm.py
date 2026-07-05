@@ -1,32 +1,28 @@
 """
 MoE Dispatch and Combine kernels ported from Triton-distributed (DeepEP) to CuTeDSL.
 
-Single-node and multi-node multi-GPU implementation using NVSHMEM.
+Single-node (intra-node) multi-GPU implementation. All communication is
+purely intra-node (P2P over NVLink), so we drop every NVSHMEM *device*
+call (put_warp / get_warp / nvshmem_ptr) and instead treat a remote GPU's
+symmetric buffer as a plain local pointer: NVSHMEM symmetric allocation +
+`nvshmem.core.get_peer_tensor` on the host hand us each peer's base
+address, and the kernels move data with ordinary CuTe copy atoms. This
+mirrors the `all_reduce_simple.py` example.
 
-Dispatch: routes MoE tokens to target expert ranks via put_warp. NVSHMEM
-          put transparently handles intra-node (P2P) and inter-node (IB)
-          peers, mirroring DeepEP `kernel_dispatch_token`'s use of
-          `libshmem_device.putmem_warp`. Supports two modes controlled by
-          WITH_SCATTER_INDICES:
+Dispatch: routes MoE tokens to target expert ranks by writing the hidden
+          vector directly into the remote rank's recv buffer via a
+          warp-cooperative `cute.copy` (128-bit). Supports two modes
+          controlled by WITH_SCATTER_INDICES:
             True  - read pre-computed scatter indices from a tensor
             False - allocate slots on-the-fly via per-warp atomic_add
                     (matching Triton-distributed kernel_dispatch_token)
-Combine:  per-peer route mirroring DeepEP `kernel_combine_token`'s
-          `expert_node_idx == node_id` predicate. For experts on the
-          same node (P2P-reachable on full-NVL hardware): direct LDG via
-          `nvshmem_ptr` at SYS-scope VOLATILE — exactly the
-          `dl.symm_at(input_buf, expert_rank)` + `tl.load` path in
-          DeepEP. For experts on a different node: NVSHMEM `get_warp`
-          fetches the slot into a local fragment, then accumulates.
-          Variable names follow DeepEP convention (`expert_node_idx`,
-          `node_id`, `local_world_size`).
+Combine:  for each of a token's topk experts, reads the expert result
+          slot directly from the owning rank's buffer via a SYS-scope
+          VOLATILE `cute.copy` (P2P LDG over NVLink) and accumulates
+          across topk to produce the final output.
 
-To run (single node):
-    torchrun --nproc-per-node 4 examples/distributed/test.py
-To run (multi node):
-    srun -p <slurm-partition> -N 2 --ntasks-per-node 1 \
-        torchrun --nnodes 2 --nproc_per_node 4 \
-                 --rdzv_endpoint=$MASTER_ADDR:29500 dispatch_and_combine.py
+To run:
+    torchrun --nproc-per-node 4 examples/distributed/dispatch_and_combine.py
 """
 
 import os
@@ -42,14 +38,6 @@ from cutlass.cutlass_dsl import Int32
 from cuda.core import Device
 
 import nvshmem.core
-import nvshmem.core.device.cute as nvshmem_cute
-from nvshmem.bindings.device.cute._cuteast import _CutePtrType
-# Define nvshmem_ptr FFI with alignment=4 to match recast from Float32*
-nvshmem_ptr_ffi = cute.ffi(
-    name="nvshmem_ptr",
-    params_types=[_CutePtrType(cutlass.Int8, alignment=4), cutlass.Int32],
-    return_type=_CutePtrType(cutlass.Int8, alignment=4),
-)
 
 import torch
 import torch.distributed as dist
@@ -171,12 +159,14 @@ def _finalize_kernels():
 
 @cute.kernel
 def dispatch_kernel(
-    input_buf: cute.Tensor, # [num_tokens, hidden_size] float32 (nvshmem)
-    output_buf: cute.Tensor, # [max_recv_tokens, hidden_size] float32 (nvshmem)
+    input_buf: cute.Tensor, # [num_tokens, hidden_size] float32 (local)
+    output_peer_ptrs: cute.Tensor, # [world_size] int64: base addr of each rank's output_buf
     topk_indices_tensor: cute.Tensor, # [num_tokens, topk] int32
     token_dst_scatter_idx: cute.Tensor, # [num_tokens, topk] int32
     recv_buf_offset_per_expert: cute.Pointer, # [world_size, experts_per_rank, world_size] int32
     num_input_tokens_per_rank: cute.Tensor, # [world_size] int32
+    max_recv_tokens: cutlass.Int32,
+    _hidden_size: cutlass.Int32,
     topk: cutlass.Int32,
     experts_per_rank: cutlass.Constexpr,
     local_rank: cutlass.Constexpr,
@@ -184,6 +174,7 @@ def dispatch_kernel(
     num_warps: cutlass.Constexpr,
     WITH_SCATTER_INDICES: cutlass.Constexpr,
 ):
+    hidden_size = cute.assume(_hidden_size, divby=16)
     WARP_SIZE = 32
     tidx, tidy, tidz = cute.arch.thread_idx()
     bdimx, bdimy, bdimz = cute.arch.block_dim()
@@ -197,7 +188,36 @@ def dispatch_kernel(
     global_warp_id = bidx * warps_per_cta + warp_id
     total_warps = warps_per_cta * cta_nums
 
+    # Warp-cooperative 128-bit copy of a hidden vector: local input row ->
+    # remote output row. The remote row lives on expert_rank's GPU but is
+    # P2P-addressable, so we obtain its base pointer from output_peer_ptrs
+    # (host-side get_peer_tensor) and store to it with an ordinary CuTe copy
+    # atom (SYS scope so the write propagates to the peer before the barrier).
+    copy_atom_load = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), input_buf.element_type, num_bits_per_copy=128)
+    copy_atom_store = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        input_buf.element_type,
+        num_bits_per_copy=128,
+        memory_scope=cute.nvgpu.common.MemoryScope.SYS,
+        memory_order=cute.nvgpu.common.MemoryOrder.VOLATILE,
+    )
+    thr_layout = cute.make_ordered_layout((1, 32), order=(1, 0))
+    val_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
+    tiled_copy_load = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
+    tiled_copy_store = cute.make_tiled_copy_tv(copy_atom_store, thr_layout, val_layout)
+    lane_id = tidx % WARP_SIZE
+    thr_copy_load = tiled_copy_load.get_slice(lane_id)
+    thr_copy_store = tiled_copy_store.get_slice(lane_id)
+
     num_tokens = num_input_tokens_per_rank[local_rank]
+
+    # Source partition over the local input buffer (reused across tokens).
+    src_layout = cute.make_ordered_layout((num_tokens, hidden_size), order=(1, 0))
+    src_tensor = cute.make_tensor(input_buf.iterator.align(16), src_layout)
+    tSgS = thr_copy_load.partition_S(src_tensor)
+    frg = cute.make_fragment_like(tSgS[None, 0, 0])
+    hidden_iter = cute.size(tSgS, mode=[2])
 
     for token_offset in range(global_warp_id, num_tokens, total_warps):
         for j in range(topk):
@@ -214,7 +234,6 @@ def dispatch_kernel(
                           + expert_idx_intra_rank * world_size + local_rank)
                 atomic_ptr = recv_buf_offset_per_expert + offset
                 store_idx = Int32(0)
-                lane_id = tidx % WARP_SIZE
                 if lane_id == 0:
                     store_idx = cute.arch.atomic_add(
                         atomic_ptr, Int32(1), sem="relaxed", scope="gpu")
@@ -223,9 +242,21 @@ def dispatch_kernel(
                 # Write back so combine kernel can read the scatter index
                 token_dst_scatter_idx[token_offset, j] = store_idx
 
-            src_row = input_buf[token_offset, None]
-            dst_row = output_buf[store_idx, None]
-            nvshmem_cute.put_warp(dst_row, src_row, expert_rank)
+            # Remote recv buffer on expert_rank, addressed as a local pointer.
+            remote_ptr = cute.make_ptr(
+                input_buf.element_type,
+                output_peer_ptrs[expert_rank],
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            remote_layout = cute.make_ordered_layout(
+                (max_recv_tokens, hidden_size), order=(1, 0))
+            remote_tensor = cute.make_tensor(remote_ptr, remote_layout)
+            tDgD = thr_copy_store.partition_D(remote_tensor)
+
+            for k in range(hidden_iter):
+                cute.copy(thr_copy_load, tSgS[None, token_offset, k], frg)
+                cute.copy(thr_copy_store, frg, tDgD[None, store_idx, k])
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +268,8 @@ def dispatch_kernel(
 
 @cute.kernel
 def combine_kernel(
-    expert_output_buf: cute.Pointer, # NVSHMEM symmetric [max_tokens, hidden_size] float32
+    expert_output_peer_ptrs: cute.Tensor, # [world_size] int64: base addr of each rank's expert_output_buf
     combine_output_buf: cute.Pointer, # local [num_tokens, hidden_size] float32
-    inter_node_get_buf: cute.Pointer, # NVSHMEM symmetric [num_tokens, hidden_size] float32 staging for inter-node get_warp
     topk_indices_tensor: cute.Tensor, # [num_tokens, topk] int32
     token_dst_scatter_idx: cute.Tensor, # [num_tokens, topk] int32
     num_input_tokens_per_rank: cute.Tensor, # [world_size] int32
@@ -248,16 +278,14 @@ def combine_kernel(
     _hidden_size: cutlass.Int32,
     experts_per_rank: cutlass.Constexpr,
     local_rank: cutlass.Constexpr,
-    local_world_size: cutlass.Constexpr,
     num_warps: cutlass.Constexpr,
 ):
-    # Mirror DeepEP `kernel_combine_token`: per-peer route by
-    # `expert_node_idx == node_id`. Same-node experts use direct LDG via
-    # `nvshmem_ptr` (DeepEP's `dl.symm_at(input_buf, expert_rank)` +
-    # `tl.load`). Cross-node experts go through NVSHMEM `get_warp` into a
-    # local symmetric staging buffer (DeepEP uses sender-push +
-    # `intra_node_reduce_buf`; receiver-pull is the simpler get-side
-    # mirror that uses no extra signal coordination).
+    # Intra-node combine: for each of a token's topk experts, read the
+    # expert result slot directly from the owning rank's expert_output_buf
+    # (P2P-addressable over NVLink) and accumulate. The remote base pointer
+    # for each rank comes from expert_output_peer_ptrs (host-side
+    # get_peer_tensor); the read is an ordinary CuTe copy at SYS scope
+    # VOLATILE so we observe the peer's post-dispatch write.
     hidden_size = cute.assume(_hidden_size, divby=16)
     WARP_SIZE = 32
     tidx, tidy, tidz = cute.arch.thread_idx()
@@ -272,37 +300,24 @@ def combine_kernel(
     global_warp_id = bidx * warps_per_cta + warp_id
     total_warps = warps_per_cta * cta_nums
 
-    # DeepEP convention: node_id = rank // local_world_size
-    node_id = local_rank // local_world_size
-
-    # SYS-scope volatile loads for reading remote GPU memory via nvshmem_ptr.
-    # `CopyUniversalOp` carries the load/store semantics via its
+    # SYS-scope volatile loads for reading remote GPU memory via a P2P
+    # pointer. `CopyUniversalOp` carries the load/store semantics via its
     # `memory_scope` / `memory_order` keyword arguments.
     copy_atom_load = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(),
-        expert_output_buf.dtype,
+        combine_output_buf.dtype,
         num_bits_per_copy=128,
         memory_scope=cute.nvgpu.common.MemoryScope.SYS,
         memory_order=cute.nvgpu.common.MemoryOrder.VOLATILE,
-    )
-    # Local LDG copy for the post-get_warp staging buffer (same dtype,
-    # but no SYS/VOLATILE semantics needed because get_warp already
-    # synchronized the data into local symmetric memory).
-    copy_atom_load_local = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(),
-        expert_output_buf.dtype,
-        num_bits_per_copy=128,
     )
     copy_atom_store = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), combine_output_buf.dtype, num_bits_per_copy=128)
     thr_layout = cute.make_ordered_layout((1, 32), order=(1, 0))
     val_layout = cute.make_ordered_layout((1, 4), order=(1, 0))
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
-    tiled_copy_load_local = cute.make_tiled_copy_tv(copy_atom_load_local, thr_layout, val_layout)
     tiled_copy_store = cute.make_tiled_copy_tv(copy_atom_store, thr_layout, val_layout)
     copy_idx = tidx % WARP_SIZE
     thr_copy_load = tiled_copy_load.get_slice(copy_idx)
-    thr_copy_load_local = tiled_copy_load_local.get_slice(copy_idx)
     thr_copy_store = tiled_copy_store.get_slice(copy_idx)
 
     num_tokens = num_input_tokens_per_rank[local_rank]
@@ -315,21 +330,7 @@ def combine_kernel(
     accum = cute.make_fragment_like(tDgD[None, 0, 0])
     hidden_iter = cute.size(tDgD, mode=[2])
 
-    # Local view over inter_node_get_buf (one slot per local token; this
-    # is per-rank symmetric, so each (warp, token) lane has its own
-    # row). The staging row is reused across topk iterations for that
-    # token so we only need shape [num_tokens, hidden_size].
-    #
-    # Two views of the same memory:
-    #   - stage_tensor_get: UNALIGNED — passed to `nvshmem_cute.get_warp`
-    #     (the FFI prototype is `!cute.ptr<f32, gmem>` with no alignment
-    #     qualifier; passing an aligned pointer triggers a CuTeDSL
-    #     prototype-mismatch error).
-    #   - stage_tensor: ALIGNED — partitioned through `thr_copy_load_local`
-    #     and read via `cute.copy` for the local accumulation step.
-    stage_layout = cute.make_ordered_layout((num_tokens, hidden_size), order=(1, 0))
-    stage_tensor_get = cute.make_tensor(inter_node_get_buf, stage_layout)
-    stage_tensor = cute.make_tensor(inter_node_get_buf.align(16), stage_layout)
+    remote_layout = cute.make_ordered_layout((max_tokens, hidden_size), order=(1, 0))
 
     for token_offset in range(global_warp_id, num_tokens, total_warps):
         for k in range(hidden_iter):
@@ -337,42 +338,19 @@ def combine_kernel(
             for j in cutlass.range_constexpr(topk):
                 expert_idx = topk_indices_tensor[token_offset, j]
                 expert_rank = expert_idx // experts_per_rank
-                expert_node_idx = expert_rank // local_world_size
                 scatter_idx = token_dst_scatter_idx[token_offset, j]
 
-                if expert_node_idx == node_id:
-                    # DeepEP same-node fast path: nvshmem_ptr direct LDG
-                    # (equivalent to triton-dist's `dl.symm_at(input_buf,
-                    # expert_rank)` + `tl.load`).
-                    int8_ptr = cute.recast_ptr(expert_output_buf, dtype=cutlass.Int8)
-                    remote_int8_ptr = nvshmem_ptr_ffi(int8_ptr, expert_rank)
-                    remote_ptr = cute.recast_ptr(remote_int8_ptr, dtype=cutlass.Float32).align(16)
+                # expert_rank's expert_output_buf, addressed as a local pointer.
+                remote_ptr = cute.make_ptr(
+                    combine_output_buf.dtype,
+                    expert_output_peer_ptrs[expert_rank],
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                remote_tensor = cute.make_tensor(remote_ptr, remote_layout)
+                tSgS_remote = thr_copy_load.partition_S(remote_tensor)
 
-                    remote_layout = cute.make_ordered_layout(
-                        (max_tokens, hidden_size), order=(1, 0))
-                    remote_tensor = cute.make_tensor(remote_ptr, remote_layout)
-                    tSgS_remote = thr_copy_load.partition_S(remote_tensor)
-
-                    cute.copy(thr_copy_load, tSgS_remote[None, scatter_idx, k], tSrS)
-                else:
-                    # Inter-node fallback: NVSHMEM get_warp pulls one
-                    # token slot from expert_rank's expert_output_buf
-                    # into our local inter_node_get_buf row, then we
-                    # load + accumulate. DeepEP uses sender-push for
-                    # this leg; the receiver-pull mirror has the same
-                    # semantics with no signal protocol.
-                    src_layout = cute.make_ordered_layout(
-                        (max_tokens, hidden_size), order=(1, 0))
-                    src_tensor_get = cute.make_tensor(
-                        cute.recast_ptr(expert_output_buf, dtype=cutlass.Float32),
-                        src_layout)
-                    nvshmem_cute.get_warp(
-                        stage_tensor_get[token_offset, None],
-                        src_tensor_get[scatter_idx, None],
-                        expert_rank,
-                    )
-                    tSgS_local = thr_copy_load_local.partition_S(stage_tensor)
-                    cute.copy(thr_copy_load_local, tSgS_local[None, token_offset, k], tSrS)
+                cute.copy(thr_copy_load, tSgS_remote[None, scatter_idx, k], tSrS)
                 accum.store(accum.load() + tSrS.load())
 
             cute.copy(thr_copy_store, accum, tDgD[None, token_offset, k])
@@ -384,12 +362,14 @@ def combine_kernel(
 
 @cute.jit
 def dispatch_jit(
-    input_buf: cute.Tensor, # [num_tokens, hidden_size] float32 (nvshmem)
-    output_buf: cute.Tensor, # [max_recv_tokens, hidden_size] float32 (nvshmem)
+    input_buf: cute.Tensor, # [num_tokens, hidden_size] float32 (local)
+    output_peer_ptrs: cute.Tensor, # [world_size] int64: peer base addr of output_buf
     topk_indices_tensor: cute.Tensor, # [num_tokens, topk] int32
     token_dst_scatter_idx: cute.Tensor, # [num_tokens, topk] int32
     recv_buf_offset_per_expert: cute.Tensor, # [world_size, experts_per_rank, world_size] int32
     num_input_tokens_per_rank: cute.Tensor, # [world_size] int32
+    max_recv_tokens: cutlass.Int32,
+    hidden_size: cutlass.Int32,
     topk: cutlass.Int32,
     experts_per_rank: cutlass.Constexpr,
     local_rank: cutlass.Constexpr,
@@ -402,11 +382,13 @@ def dispatch_jit(
 
     dispatch_kernel(
         input_buf,
-        output_buf,
+        output_peer_ptrs,
         topk_indices_tensor,
         token_dst_scatter_idx,
         recv_buf_offset_per_expert.iterator,
         num_input_tokens_per_rank,
+        max_recv_tokens,
+        hidden_size,
         topk,
         experts_per_rank,
         local_rank,
@@ -421,9 +403,8 @@ def dispatch_jit(
 
 @cute.jit
 def combine_jit(
-    expert_output_buf: cute.Tensor, # NVSHMEM symmetric [max_tokens, hidden_size] float32
+    expert_output_peer_ptrs: cute.Tensor, # [world_size] int64: peer base addr of expert_output_buf
     combine_output_buf: cute.Tensor, # local [num_tokens, hidden_size] float32
-    inter_node_get_buf: cute.Tensor, # NVSHMEM symmetric [num_tokens, hidden_size] float32
     topk_indices_tensor: cute.Tensor, # [num_tokens, topk] int32
     token_dst_scatter_idx: cute.Tensor, # [num_tokens, topk] int32
     num_input_tokens_per_rank: cute.Tensor, # [world_size] int32
@@ -432,16 +413,14 @@ def combine_jit(
     topk: cutlass.Constexpr,
     experts_per_rank: cutlass.Constexpr,
     local_rank: cutlass.Constexpr,
-    local_world_size: cutlass.Constexpr,
 ):
 
     num_warps = 32
     cta_nums = 20
 
     combine_kernel(
-        expert_output_buf.iterator,
+        expert_output_peer_ptrs,
         combine_output_buf.iterator,
-        inter_node_get_buf.iterator,
         topk_indices_tensor,
         token_dst_scatter_idx,
         num_input_tokens_per_rank,
@@ -450,12 +429,26 @@ def combine_jit(
         hidden_size,
         experts_per_rank,
         local_rank,
-        local_world_size,
         num_warps,
     ).launch(
         grid=[cta_nums, 1, 1],
         block=[num_warps * 32, 1, 1],
     )
+
+
+# ---------------------------------------------------------------------------
+# Peer-pointer helper: map an NVSHMEM symmetric tensor to each rank's base
+# address so kernels can address remote buffers as plain local pointers.
+# ---------------------------------------------------------------------------
+
+def _peer_ptr_tensor(symm_tensor, world_size, device):
+    """Return an int64[world_size] tensor of each rank's P2P base address for
+    `symm_tensor` (obtained via nvshmem.core.get_peer_tensor). Indexed by a
+    runtime rank inside the kernel via cute.make_ptr."""
+    return torch.tensor(
+        [nvshmem.core.get_peer_tensor(symm_tensor, r).data_ptr()
+         for r in range(world_size)],
+        device=device, dtype=torch.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +610,8 @@ def check_combine(combine_output, expert_output_buf, topk_indices,
 
 def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                              benchmark=False, warmup_iterations=10,
-                             iterations=100, save_baseline_to=None):
+                             iterations=100, save_baseline_to=None,
+                             bench_only="both"):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     experts_per_rank = num_experts // world_size
@@ -634,7 +628,7 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     node_id = rank // local_world_size
 
     if rank == 0:
-        print(f"\nMoE Dispatch test (NVSHMEM put_warp, multi-GPU):")
+        print(f"\nMoE Dispatch test (intra-node P2P cute.copy, multi-GPU):")
         print(f"  num_tokens={num_tokens}, hidden={hidden}, "
               f"num_experts={num_experts}, topk={topk}")
         print(f"  world_size={world_size}, experts_per_rank={experts_per_rank}")
@@ -733,8 +727,10 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         (num_tokens, topk), dtype=torch.int32, device=device)
     recv_buf_offset = recv_buf_offset_data.clone()
 
+    output_peer_ptrs = _peer_ptr_tensor(output_buf, world_size, device)
+
     input_cute   = from_dlpack(input_buf)
-    output_cute  = from_dlpack(output_buf)
+    output_peer_cute = from_dlpack(output_peer_ptrs)
     topk_idx_cute = from_dlpack(topk_indices_tensor)
     scatter_atomic_cute = from_dlpack(scatter_idx_atomic)
     recv_cute    = from_dlpack(recv_buf_offset)
@@ -744,8 +740,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         print("Compiling dispatch kernel (WITH_SCATTER_INDICES=False)...")
     compiled_atomic = _compile_kernel(
         dispatch_jit,
-        input_cute, output_cute, topk_idx_cute, scatter_atomic_cute,
-        recv_cute, ntok_cute,
+        input_cute, output_peer_cute, topk_idx_cute, scatter_atomic_cute,
+        recv_cute, ntok_cute, max_recv_tokens, hidden,
         topk, experts_per_rank, rank, world_size, False,
     )
 
@@ -755,8 +751,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     if rank == 0:
         print("Running dispatch kernel...")
     compiled_atomic(
-        input_cute, output_cute, topk_idx_cute, scatter_atomic_cute,
-        recv_cute, ntok_cute,
+        input_cute, output_peer_cute, topk_idx_cute, scatter_atomic_cute,
+        recv_cute, ntok_cute, max_recv_tokens, hidden,
         topk,
     )
 
@@ -791,8 +787,10 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     recv_buf_offset_dummy = torch.zeros(
         (world_size, experts_per_rank, world_size), dtype=torch.int32, device=device)
 
+    output_peer_ptrs = _peer_ptr_tensor(output_buf, world_size, device)
+
     input_cute   = from_dlpack(input_buf)
-    output_cute  = from_dlpack(output_buf)
+    output_peer_cute = from_dlpack(output_peer_ptrs)
     topk_idx_cute = from_dlpack(topk_indices_tensor)
     scatter_cute = from_dlpack(token_dst_scatter_idx)
     recv_dummy_cute = from_dlpack(recv_buf_offset_dummy)
@@ -802,8 +800,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         print("Compiling dispatch kernel (WITH_SCATTER_INDICES=True)...")
     compiled_scatter = _compile_kernel(
         dispatch_jit,
-        input_cute, output_cute, topk_idx_cute, scatter_cute,
-        recv_dummy_cute, ntok_cute,
+        input_cute, output_peer_cute, topk_idx_cute, scatter_cute,
+        recv_dummy_cute, ntok_cute, max_recv_tokens, hidden,
         topk, experts_per_rank, rank, world_size, True,
     )
 
@@ -813,8 +811,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     if rank == 0:
         print("Running dispatch kernel...")
     compiled_scatter(
-        input_cute, output_cute, topk_idx_cute, scatter_cute,
-        recv_dummy_cute, ntok_cute,
+        input_cute, output_peer_cute, topk_idx_cute, scatter_cute,
+        recv_dummy_cute, ntok_cute, max_recv_tokens, hidden,
         topk,
     )
 
@@ -845,18 +843,13 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     combine_output_buf = torch.zeros(
         (num_tokens, hidden), dtype=torch.float32, device=device)
 
-    # Per-rank symmetric staging for inter-node get_warp. Mirrors the
-    # role of DeepEP's `intra_node_reduce_buf` (pre-shipping accum) but
-    # used here as a receiver-side per-token landing pad. Sized for the
-    # local rank's token count (NVSHMEM symmetric: same shape on every
-    # rank, but each rank only writes its own slice).
-    inter_node_get_buf = nvshmem.core.tensor(
-        (num_tokens, hidden), dtype=torch.float32)
-    inter_node_get_buf.fill_(0)
+    # Peer base addresses of output_buf (the identity expert output, filled
+    # by dispatch). Combine reads each expert's slot from the owning rank's
+    # buffer directly over NVLink.
+    expert_output_peer_ptrs = _peer_ptr_tensor(output_buf, world_size, device)
 
-    expert_output_cute = from_dlpack(output_buf)  # NVSHMEM symmetric, filled by dispatch
+    expert_output_peer_cute = from_dlpack(expert_output_peer_ptrs)
     combine_cute = from_dlpack(combine_output_buf)
-    inter_node_get_cute = from_dlpack(inter_node_get_buf)
     topk_idx_cute = from_dlpack(topk_indices_tensor)
     scatter_cute = from_dlpack(token_dst_scatter_idx)
     ntok_cute = from_dlpack(num_input_tokens_per_rank)
@@ -865,10 +858,10 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         print("Compiling combine kernel...")
     compiled_combine = _compile_kernel(
         combine_jit,
-        expert_output_cute, combine_cute, inter_node_get_cute,
+        expert_output_peer_cute, combine_cute,
         topk_idx_cute, scatter_cute,
         ntok_cute, max_recv_tokens, hidden,
-        topk, experts_per_rank, rank, local_world_size,
+        topk, experts_per_rank, rank,
     )
 
     torch.cuda.synchronize()
@@ -877,7 +870,7 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
     if rank == 0:
         print("Running combine kernel...")
     compiled_combine(
-        expert_output_cute, combine_cute, inter_node_get_cute,
+        expert_output_peer_cute, combine_cute,
         topk_idx_cute, scatter_cute,
         ntok_cute, max_recv_tokens, hidden,
     )
@@ -1022,8 +1015,9 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         # Re-allocate input_buf for dispatch benchmark (was freed earlier)
         input_buf = nvshmem.core.tensor((num_tokens, hidden), dtype=torch.float32)
         input_buf.copy_(input_data)
+        output_peer_ptrs = _peer_ptr_tensor(output_buf, world_size, device)
         input_cute = from_dlpack(input_buf)
-        output_cute = from_dlpack(output_buf)
+        output_peer_cute = from_dlpack(output_peer_ptrs)
         topk_idx_cute = from_dlpack(topk_indices_tensor)
         scatter_cute = from_dlpack(token_dst_scatter_idx)
         recv_dummy_cute = from_dlpack(recv_buf_offset_dummy)
@@ -1031,8 +1025,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
 
         # Run dispatch once to fill output_buf for combine benchmark
         compiled_scatter(
-            input_cute, output_cute, topk_idx_cute, scatter_cute,
-            recv_dummy_cute, ntok_cute, topk,
+            input_cute, output_peer_cute, topk_idx_cute, scatter_cute,
+            recv_dummy_cute, ntok_cute, max_recv_tokens, hidden, topk,
         )
         torch.cuda.synchronize()
         nvshmem_stream = Device().create_stream()
@@ -1041,18 +1035,16 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
 
         combine_output_buf2 = torch.zeros(
             (num_tokens, hidden), dtype=torch.float32, device=device)
-        expert_output_cute = from_dlpack(output_buf)
+        expert_output_peer_cute = from_dlpack(
+            _peer_ptr_tensor(output_buf, world_size, device))
         combine_cute2 = from_dlpack(combine_output_buf2)
-        # Reuse the per-rank symmetric staging buffer allocated for the
-        # correctness run; the benchmark path doesn't reallocate.
-        inter_node_get_cute_bench = from_dlpack(inter_node_get_buf)
 
         dispatch_args = (
-            input_cute, output_cute, topk_idx_cute, scatter_cute,
-            recv_dummy_cute, ntok_cute, topk,
+            input_cute, output_peer_cute, topk_idx_cute, scatter_cute,
+            recv_dummy_cute, ntok_cute, max_recv_tokens, hidden, topk,
         )
         combine_args = (
-            expert_output_cute, combine_cute2, inter_node_get_cute_bench,
+            expert_output_peer_cute, combine_cute2,
             topk_idx_cute, scatter_cute,
             ntok_cute, max_recv_tokens, hidden,
         )
@@ -1061,10 +1053,10 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
             dispatch_args, combine_args,
             num_tokens, hidden, topk, rank,
             warmup_iterations, iterations,
+            bench_only=bench_only,
         )
         nvshmem.core.free_tensor(input_buf)
 
-    nvshmem.core.free_tensor(inter_node_get_buf)
     nvshmem.core.free_tensor(output_buf)
 
 
@@ -1087,8 +1079,13 @@ def _bench_kernel(kernel_fn, args, warmup, iterations):
 def run_moe_benchmark(compiled_dispatch, compiled_combine,
                       dispatch_args, combine_args,
                       num_tokens, hidden, topk,
-                      rank, warmup_iterations=10, iterations=100):
-    """Benchmark dispatch and combine kernels separately."""
+                      rank, warmup_iterations=10, iterations=100,
+                      bench_only="both"):
+    """Benchmark dispatch and combine kernels separately.
+
+    `bench_only` selects which kernel(s) to time: "dispatch", "combine",
+    or "both" (default).
+    """
 
     if rank == 0:
         print(f"\n{'='*40}")
@@ -1096,45 +1093,54 @@ def run_moe_benchmark(compiled_dispatch, compiled_combine,
         print(f"{'='*40}")
 
     bytes_moved = num_tokens * topk * hidden * 4  # float32
+    dispatch_time = None
+    combine_time = None
 
     # Benchmark Dispatch
-    if rank == 0:
-        print("\n--- Benchmark: Dispatch ---")
-    dist.barrier()
-    dispatch_time = _bench_kernel(
-        compiled_dispatch, dispatch_args, warmup_iterations, iterations)
-    if rank == 0:
-        bw_gbps = bytes_moved / (dispatch_time * 1e-6) / 1e9
-        print(f"  Dispatch time: {dispatch_time:.2f} us  "
-              f"BW: {bw_gbps:.2f} GB/s")
+    if bench_only in ("both", "dispatch"):
+        if rank == 0:
+            print("\n--- Benchmark: Dispatch ---")
+        dist.barrier()
+        dispatch_time = _bench_kernel(
+            compiled_dispatch, dispatch_args, warmup_iterations, iterations)
+        if rank == 0:
+            bw_gbps = bytes_moved / (dispatch_time * 1e-6) / 1e9
+            print(f"  Dispatch time: {dispatch_time:.2f} us  "
+                  f"BW: {bw_gbps:.2f} GB/s")
 
     # Benchmark Combine
-    if rank == 0:
-        print("\n--- Benchmark: Combine ---")
-    dist.barrier()
-    combine_time = _bench_kernel(
-        compiled_combine, combine_args, warmup_iterations, iterations)
-    if rank == 0:
-        bw_gbps = bytes_moved / (combine_time * 1e-6) / 1e9
-        print(f"  Combine time:  {combine_time:.2f} us  "
-              f"BW: {bw_gbps:.2f} GB/s")
+    if bench_only in ("both", "combine"):
+        if rank == 0:
+            print("\n--- Benchmark: Combine ---")
+        dist.barrier()
+        combine_time = _bench_kernel(
+            compiled_combine, combine_args, warmup_iterations, iterations)
+        if rank == 0:
+            bw_gbps = bytes_moved / (combine_time * 1e-6) / 1e9
+            print(f"  Combine time:  {combine_time:.2f} us  "
+                  f"BW: {bw_gbps:.2f} GB/s")
 
     if rank == 0:
         print(f"\n  Summary:")
-        print(f"    Dispatch: {dispatch_time:.2f} us")
-        print(f"    Combine:  {combine_time:.2f} us")
-        print(f"    Total:    {dispatch_time + combine_time:.2f} us")
+        if dispatch_time is not None:
+            print(f"    Dispatch: {dispatch_time:.2f} us")
+        if combine_time is not None:
+            print(f"    Combine:  {combine_time:.2f} us")
+        if dispatch_time is not None and combine_time is not None:
+            print(f"    Total:    {dispatch_time + combine_time:.2f} us")
 
 
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
-        warmup_iterations=10, iterations=100, save_baseline_to=None):
+        warmup_iterations=10, iterations=100, save_baseline_to=None,
+        bench_only="both"):
     torchrun_uid_init_bcast()
     try:
         run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                                  benchmark=benchmark,
                                  warmup_iterations=warmup_iterations,
                                  iterations=iterations,
-                                 save_baseline_to=save_baseline_to)
+                                 save_baseline_to=save_baseline_to,
+                                 bench_only=bench_only)
     finally:
         _finalize_kernels()
         torchrun_finalize()
@@ -1151,6 +1157,10 @@ def main():
     parser.add_argument("--topk", default=8, type=int)
     parser.add_argument("--benchmark", action="store_true",
                         help="Run performance benchmarks after correctness tests")
+    parser.add_argument("--bench-only", default="both",
+                        choices=["both", "dispatch", "combine"],
+                        help="Benchmark only the dispatch or combine kernel "
+                             "(default: both)")
     parser.add_argument("--warmup_iterations", default=10, type=int)
     parser.add_argument("--iterations", default=100, type=int)
     parser.add_argument("--save-baseline-to", default=None,
@@ -1165,7 +1175,8 @@ def main():
         benchmark=args.benchmark,
         warmup_iterations=args.warmup_iterations,
         iterations=args.iterations,
-        save_baseline_to=args.save_baseline_to)
+        save_baseline_to=args.save_baseline_to,
+        bench_only=args.bench_only)
 
 
 if __name__ == "__main__":
