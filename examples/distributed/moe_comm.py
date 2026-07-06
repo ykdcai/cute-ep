@@ -827,7 +827,8 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                              iterations=100, save_baseline_to=None,
                              bench_only="both",
                              combine_cta_nums=148, combine_num_warps=32,
-                             combine_impl="reg", combine_tma_cfg=None):
+                             combine_impl="reg", combine_tma_cfg=None,
+                             autotune=False):
     combine_tma_cfg = combine_tma_cfg or {}
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -1282,13 +1283,29 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
                 topk_idx_cute, scatter_cute,
                 ntok_cute, max_recv_tokens, hidden,
             )
-        run_moe_benchmark(
-            compiled_scatter, compiled_combine,
-            dispatch_args, combine_args,
-            num_tokens, hidden, topk, rank,
-            warmup_iterations, iterations,
-            bench_only=bench_only,
-        )
+        if autotune:
+            autotune_combine_tma(
+                peer_output_tensors=peer_output_tensors,
+                combine_cute=combine_cute2,
+                combine_output_buf=combine_output_buf2,
+                output_buf=output_buf,
+                topk_idx_cute=topk_idx_cute,
+                scatter_cute=scatter_cute,
+                ntok_cute=ntok_cute,
+                topk_indices_tensor=topk_indices_tensor,
+                token_dst_scatter_idx=token_dst_scatter_idx,
+                num_tokens=num_tokens, hidden=hidden, topk=topk,
+                experts_per_rank=experts_per_rank,
+                rank=rank, world_size=world_size, device=device,
+                warmup_iterations=warmup_iterations, iterations=iterations)
+        else:
+            run_moe_benchmark(
+                compiled_scatter, compiled_combine,
+                dispatch_args, combine_args,
+                num_tokens, hidden, topk, rank,
+                warmup_iterations, iterations,
+                bench_only=bench_only,
+            )
         nvshmem.core.free_tensor(input_buf)
 
     nvshmem.core.free_tensor(output_buf)
@@ -1364,10 +1381,154 @@ def run_moe_benchmark(compiled_dispatch, compiled_combine,
             print(f"    Total:    {dispatch_time + combine_time:.2f} us")
 
 
+def autotune_combine_tma(*, peer_output_tensors, combine_cute, combine_output_buf,
+                         output_buf, topk_idx_cute, scatter_cute, ntok_cute,
+                         topk_indices_tensor, token_dst_scatter_idx,
+                         num_tokens, hidden, topk, experts_per_rank,
+                         rank, world_size, device,
+                         warmup_iterations, iterations,
+                         num_sm=148, smem_cap_kb=227):
+    """Lightweight in-process autotune for the TMA combine kernel.
+
+    SM efficiency is the objective: saturate NVLink with as few CTAs (=SMs)
+    as possible so the rest of the GPU can run expert GEMMs. Two phases:
+      1. Fix a reference CTA count, sweep (hchunk, num_stages) tile configs.
+      2. Take the best tile config, sweep CTA count down to find the knee
+         where BW stops improving -> the SM-efficient operating point.
+
+    Every config is validated against the combine reference before timing, so
+    a fast-but-wrong config can never win.
+    """
+    bytes_moved = num_tokens * topk * hidden * 4  # float32, one topk-sum pass
+    args = (peer_output_tensors, combine_cute, topk_idx_cute, scatter_cute, ntok_cute)
+
+    def bench_one(cfg, cta):
+        smem_b = cfg["hchunk"] * cfg["num_stages"] * 4  # + mbars/align (small)
+        if smem_b > smem_cap_kb * 1024:
+            return None  # won't fit in smem
+        try:
+            kernel = CombineTmaKernel(cutlass.Float32, hidden, topk, **cfg)
+            compiled = cute.compile(
+                kernel, *args, experts_per_rank, rank, world_size, cta)
+        except Exception as exc:  # noqa: BLE001 - report and skip bad configs
+            if rank == 0:
+                print(f"    [skip] cfg={cfg} cta={cta}: compile failed ({exc})")
+            return None
+        # Correctness gate.
+        combine_output_buf.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+        compiled(*args)
+        torch.cuda.synchronize()
+        nstream = Device().create_stream()
+        nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD, stream=nstream)
+        nstream.sync()
+        ok = check_combine(
+            combine_output_buf, output_buf, topk_indices_tensor,
+            token_dst_scatter_idx, num_tokens, topk, experts_per_rank,
+            rank, world_size)
+        ok_t = torch.tensor(int(ok), dtype=torch.int32, device=device)
+        dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
+        ok = bool(ok_t.item())
+        dist.barrier()
+        us = _bench_kernel(compiled, args, warmup_iterations, iterations)
+        bw = bytes_moved / (us * 1e-6) / 1e9
+        return us, bw, ok
+
+    # Tile configs: (hchunk, num_stages) under the smem budget. hchunk must
+    # divide hidden; larger hchunk => fewer barrier round-trips per byte but
+    # forces fewer stages (less topk-load overlap).
+    tile_cfgs = [
+        dict(hchunk=1792, num_stages=16),
+        dict(hchunk=1792, num_stages=8),
+        dict(hchunk=3584, num_stages=8),
+        dict(hchunk=3584, num_stages=4),
+        dict(hchunk=7168, num_stages=4),
+        dict(hchunk=7168, num_stages=2),
+    ]
+    tile_cfgs = [c for c in tile_cfgs if hidden % c["hchunk"] == 0]
+    cta_list = [c for c in [8, 12, 16, 20, 24, 32, 48, 64, num_sm] if c <= num_sm]
+    REF_CTA = 32 if 32 <= num_sm else num_sm
+
+    cache = {}  # (hchunk, stages, cta) -> (us, bw, ok)
+
+    def key(cfg, cta):
+        return (cfg["hchunk"], cfg["num_stages"], cta)
+
+    if rank == 0:
+        print(f"\n{'='*60}")
+        print("TMA Combine autotune  (objective: GB/s per SM)")
+        print(f"  tokens={num_tokens} hidden={hidden} topk={topk} "
+              f"bytes={bytes_moved/1e6:.1f} MB  num_sm={num_sm}")
+        print(f"{'='*60}")
+
+    # ---- Phase 1: tile sweep at reference CTA count ----
+    if rank == 0:
+        print(f"\n-- Phase 1: (hchunk, stages) sweep @ {REF_CTA} CTAs --")
+        print(f"  {'hchunk':>7} {'stages':>6} {'smem_KB':>7} "
+              f"{'us':>8} {'GB/s':>8} {'ok':>4}")
+    phase1 = []
+    for cfg in tile_cfgs:
+        res = bench_one(cfg, REF_CTA)
+        if res is None:
+            continue
+        us, bw, ok = res
+        cache[key(cfg, REF_CTA)] = res
+        phase1.append((cfg, us, bw, ok))
+        if rank == 0:
+            print(f"  {cfg['hchunk']:>7} {cfg['num_stages']:>6} "
+                  f"{cfg['hchunk']*cfg['num_stages']*4//1024:>7} "
+                  f"{us:>8.1f} {bw:>8.1f} {'Y' if ok else 'N':>4}")
+
+    passing = [p for p in phase1 if p[3]]
+    if not passing:
+        if rank == 0:
+            print("  no passing tile config; aborting autotune")
+        return
+    best_cfg = max(passing, key=lambda p: p[2])[0]
+    if rank == 0:
+        print(f"  -> best tile: hchunk={best_cfg['hchunk']} "
+              f"stages={best_cfg['num_stages']}")
+
+    # ---- Phase 2: CTA sweep at best tile config ----
+    if rank == 0:
+        print(f"\n-- Phase 2: CTA sweep @ hchunk={best_cfg['hchunk']} "
+              f"stages={best_cfg['num_stages']} --")
+        print(f"  {'CTAs':>5} {'us':>8} {'GB/s':>8} {'GB/s/SM':>8} {'ok':>4}")
+    phase2 = []
+    for cta in cta_list:
+        res = cache.get(key(best_cfg, cta)) or bench_one(best_cfg, cta)
+        if res is None:
+            continue
+        us, bw, ok = res
+        phase2.append((cta, us, bw, ok))
+        if rank == 0:
+            print(f"  {cta:>5} {us:>8.1f} {bw:>8.1f} {bw/cta:>8.2f} "
+                  f"{'Y' if ok else 'N':>4}")
+
+    # ---- SM-efficient pick: fewest CTAs within 5% of peak BW ----
+    good = [p for p in phase2 if p[3]]
+    if rank == 0 and good:
+        peak_bw = max(p[2] for p in good)
+        knee = min((p for p in good if p[2] >= 0.95 * peak_bw),
+                   key=lambda p: p[0])
+        print(f"\n  peak BW: {peak_bw:.1f} GB/s")
+        print(f"  SM-efficient pick (>=95% peak at fewest CTAs): "
+              f"hchunk={best_cfg['hchunk']} stages={best_cfg['num_stages']} "
+              f"cta={knee[0]} -> {knee[2]:.1f} GB/s "
+              f"({knee[2]/knee[0]:.2f} GB/s/SM)")
+
+
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
         warmup_iterations=10, iterations=100, save_baseline_to=None,
         bench_only="both", combine_cta_nums=148, combine_num_warps=32,
-        combine_impl="reg", combine_tma_cfg=None):
+        combine_impl="reg", combine_tma_cfg=None, autotune=False):
+    # Autotune is TMA-specific and needs the benchmark harness (dispatch-once
+    # fill + timing loop), so it implies both.
+    if autotune:
+        benchmark = True
+        combine_impl = "tma"
+        bench_only = "combine"
     torchrun_uid_init_bcast()
     try:
         run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
@@ -1379,7 +1540,8 @@ def run(num_tokens, hidden, num_experts, topk, benchmark=False,
                                  combine_cta_nums=combine_cta_nums,
                                  combine_num_warps=combine_num_warps,
                                  combine_impl=combine_impl,
-                                 combine_tma_cfg=combine_tma_cfg)
+                                 combine_tma_cfg=combine_tma_cfg,
+                                 autotune=autotune)
     finally:
         _finalize_kernels()
         torchrun_finalize()
@@ -1394,33 +1556,46 @@ def main():
     parser.add_argument("--num_experts", default=256, type=int,
                         help="Total experts, must be divisible by world_size")
     parser.add_argument("--topk", default=8, type=int)
-    parser.add_argument("--benchmark", action="store_true",
-                        help="Run performance benchmarks after correctness tests")
-    parser.add_argument("--bench-only", default="both",
-                        choices=["both", "dispatch", "combine"],
-                        help="Benchmark only the dispatch or combine kernel "
-                             "(default: both)")
-    parser.add_argument("--combine-cta-nums", default=148, type=int,
-                        help="Combine grid size (CTAs). Read-bound, so covering "
-                             "all SMs matters (B200 has 148).")
-    parser.add_argument("--combine-num-warps", default=32, type=int,
-                        help="Warps per combine CTA (block = num_warps * 32). "
-                             "148 CTAs x 32 warps = 2 CTAs/SM = full occupancy.")
-    parser.add_argument("--combine-impl", default="reg",
-                        choices=["reg", "tma"],
-                        help="Combine implementation: 'reg' (register LD.256) or "
-                             "'tma' (SM-efficient TMA-bulk peer->smem).")
-    # Autotunable TMA-combine knobs (only used when --combine-impl tma).
-    parser.add_argument("--tma-hchunk", default=3584, type=int,
-                        help="Hidden elems per bulk tile (must divide hidden).")
-    parser.add_argument("--tma-stages", default=8, type=int,
-                        help="Smem pipeline depth (>= topk for full overlap).")
-    parser.add_argument("--tma-producer-threads", default=32, type=int,
-                        help="Producer threads per CTA (only 1 issues the bulk copy).")
-    parser.add_argument("--tma-consumer-threads", default=128, type=int,
-                        help="Consumer threads per CTA (must divide hchunk).")
-    parser.add_argument("--warmup_iterations", default=10, type=int)
-    parser.add_argument("--iterations", default=100, type=int)
+    # -- Benchmark --
+    bench = parser.add_argument_group("benchmark")
+    bench.add_argument("--benchmark", action="store_true",
+                       help="Run performance benchmarks after correctness tests")
+    bench.add_argument("--bench-only", default="both",
+                       choices=["both", "dispatch", "combine"],
+                       help="Benchmark only the dispatch or combine kernel "
+                            "(default: both)")
+    bench.add_argument("--warmup_iterations", default=10, type=int)
+    bench.add_argument("--iterations", default=100, type=int)
+
+    # -- Combine kernel selection + manual config --
+    comb = parser.add_argument_group("combine")
+    comb.add_argument("--combine-impl", default="reg",
+                      choices=["reg", "tma"],
+                      help="Combine implementation: 'reg' (register LD.256) or "
+                           "'tma' (SM-efficient TMA-bulk peer->smem).")
+    comb.add_argument("--combine-cta-nums", default=148, type=int,
+                      help="Combine grid size (CTAs).")
+    comb.add_argument("--combine-num-warps", default=32, type=int,
+                      help="Warps per combine CTA (reg impl only; "
+                           "block = num_warps * 32).")
+    comb.add_argument("--tma-hchunk", default=3584, type=int,
+                      help="[tma] Hidden elems per bulk tile (must divide hidden).")
+    comb.add_argument("--tma-stages", default=8, type=int,
+                      help="[tma] Smem pipeline depth (>= topk for full overlap).")
+    comb.add_argument("--tma-producer-threads", default=32, type=int,
+                      help="[tma] Producer threads per CTA (only 1 issues the copy).")
+    comb.add_argument("--tma-consumer-threads", default=128, type=int,
+                      help="[tma] Consumer threads per CTA (must divide hchunk).")
+
+    # -- Autotune (self-contained mode) --
+    auto = parser.add_argument_group("autotune")
+    auto.add_argument("--autotune-combine", action="store_true",
+                      help="Sweep the TMA combine for SM efficiency and print a "
+                           "GB/s-per-SM table. Implies --benchmark --combine-impl "
+                           "tma --bench-only combine, and sweeps CTA count + "
+                           "(hchunk, stages) itself -- so --combine-cta-nums, "
+                           "--tma-hchunk and --tma-stages are ignored in this mode.")
+
     parser.add_argument("--save-baseline-to", default=None,
                         help="If set, rank 0 saves output_buf + combine_output_buf "
                              "(plus indices and shape constants) as a .npz file at "
@@ -1443,7 +1618,8 @@ def main():
             num_stages=args.tma_stages,
             tma_threads=args.tma_producer_threads,
             consumer_threads=args.tma_consumer_threads,
-        ))
+        ),
+        autotune=args.autotune_combine)
 
 
 if __name__ == "__main__":
