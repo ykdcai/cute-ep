@@ -1,7 +1,7 @@
 """
 MoE Dispatch and Combine kernels ported from Triton-distributed (DeepEP) to CuTeDSL.
 
-Single-node (intra-node) multi-GPU implementation. All communication is
+Single-1 (intra-node) multi-GPU implementation. All communication is
 purely intra-node (P2P over NVLink), so we drop every NVSHMEM *device*
 call (put_warp / get_warp / nvshmem_ptr) and instead treat a remote GPU's
 symmetric buffer as a plain local pointer: NVSHMEM symmetric allocation +
