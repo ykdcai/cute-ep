@@ -24,6 +24,7 @@ from cutlass.cute.nvgpu.warp import (
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
+from quack.cute_dsl_utils import nanosleep
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
@@ -1085,9 +1086,35 @@ class GemmSm100(GemmTmaBase):
                 pipeline.PipelineUserType.Consumer, self.a_prefetch_stage
             )
             do_epi_load_barrier_arrive = Boolean(True)
+            # TilePipe: last batch whose ready flag we have already observed at
+            # target, so consecutive work tiles of the same expert skip the wait.
+            ready_batch_idx = Int32(-1)
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
                 batch_idx = tile_coord_mnkl[3]
+                if const_expr(varlen_params.mReadyFlags is not None):
+                    # Wait until dispatch has delivered every token of this
+                    # expert (flag counts arrived tokens; target is the
+                    # expert's segment length) before issuing any TMA load.
+                    if batch_idx != ready_batch_idx:
+                        # Poll from a single lane: redundant sys-scope atomics
+                        # from all 32 lanes would serialize at the L2 atomic
+                        # unit and contend with dispatch's increments on the
+                        # same line. Only the TMA-issuing thread needs the
+                        # acquire; sync_warp holds the other lanes back.
+                        if cute.arch.lane_idx() == 0:
+                            flag_ptr = varlen_params.mReadyFlags.iterator + batch_idx
+                            target = varlen_manager.len_m(batch_idx)
+                            arrived = cute.arch.atomic_add(
+                                flag_ptr, Int32(0), sem="acquire", scope="sys"
+                            )
+                            while arrived < target:
+                                nanosleep(256)
+                                arrived = cute.arch.atomic_add(
+                                    flag_ptr, Int32(0), sem="acquire", scope="sys"
+                                )
+                        cute.arch.sync_warp()
+                        ready_batch_idx = batch_idx
                 # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),

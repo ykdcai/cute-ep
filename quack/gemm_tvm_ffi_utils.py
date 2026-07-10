@@ -87,17 +87,18 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx):
+def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, ready_flags=None):
     if cu_seqlens_m is None and cu_seqlens_k is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
         mCuSeqlensK=cu_seqlens_k,
         mAIdx=A_idx,
+        mReadyFlags=ready_flags,
     )
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
+def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_ready_flags=False):
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
@@ -110,6 +111,11 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len):
         ),
         mAIdx=(
             fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
+        ),
+        mReadyFlags=(
+            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+            if has_ready_flags
+            else None
         ),
     )
 

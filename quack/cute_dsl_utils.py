@@ -189,3 +189,28 @@ class ParamsBase:
         return values
 
     __new_from_mlir_values__ = _new_from_mlir_values
+
+
+# ---------------------------------------------------------------------------
+# Device-side helpers
+# ---------------------------------------------------------------------------
+
+from cutlass.cutlass_dsl import dsl_user_op as _dsl_user_op  # noqa: E402
+from cutlass._mlir.dialects import llvm as _llvm  # noqa: E402
+
+
+@_dsl_user_op
+def nanosleep(ns: int | Int32, *, loc=None, ip=None) -> None:
+    """Suspend the calling warp for ~ns nanoseconds (sm_70+ scheduler hint).
+
+    Used in spin-wait loops (e.g. TilePipe expert ready flags) to avoid
+    hammering the memory system with back-to-back polls.
+    """
+    _llvm.inline_asm(
+        None,
+        [Int32(ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+    )

@@ -17,6 +17,10 @@ class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
+    # TilePipe: per-batch (per-expert) token-arrival counters in gmem. When set
+    # (varlen_m only), the AB load warps wait until mReadyFlags[b] reaches the
+    # batch's segment length before issuing any TMA load for batch b.
+    mReadyFlags: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -25,6 +29,7 @@ class VarlenManager:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
+        mReadyFlags: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -33,6 +38,7 @@ class VarlenManager:
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
+                mReadyFlags=args.mReadyFlags,
             )
 
     def __init__(

@@ -65,6 +65,7 @@ def _compile_gemm(
     sr_seed_mode,
     has_trace_ptr,
     num_warps,
+    has_ready_flags=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -117,7 +118,9 @@ def _compile_gemm(
         (is_dynamic_persistent and device_capacity[0] <= 9), has_batch_idx_permute, l
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    varlen_args = make_fake_varlen_args(
+        varlen_m, varlen_k, gather_A, aidx_len, has_ready_flags=has_ready_flags
+    )
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -174,6 +177,11 @@ def gemm(
     concat_layout: dict | None = None,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
     num_warps: Optional[int] = None,
+    # TilePipe: (l,) int32 token-arrival counters, one per varlen_m batch (expert).
+    # The mainloop waits for expert_ready_flags[b] >= seqlen_m(b) before loading batch b.
+    expert_ready_flags: Optional[Tensor] = None,
+    # TilePipe: cap on persistent clusters so some SMs stay free for a comm kernel.
+    max_active_clusters: Optional[int] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -191,6 +199,9 @@ def gemm(
     if varlen_k:
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
+    if expert_ready_flags is not None:
+        assert varlen_m, "expert_ready_flags requires varlen_m (grouped GEMM)"
+        assert not gather_A, "expert_ready_flags not supported with gather_A"
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
@@ -253,6 +264,7 @@ def gemm(
         sr_seed_mode,
         trace_ptr is not None,
         num_warps,
+        expert_ready_flags is not None,
     )
 
     from quack.cache import is_compile_only
@@ -269,9 +281,12 @@ def gemm(
             return scalar.data_ptr()
 
     cluster_size = cluster_M * cluster_N * cluster_K
-    max_active_clusters = (
-        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
-    )
+    if max_active_clusters is None:
+        max_active_clusters = (
+            get_max_active_clusters(cluster_size, device_capacity=device_capacity)
+            if persistent
+            else 0
+        )
 
     epi_args = GemmDefaultEpiMixin.EpilogueArguments(
         alpha=scalar_arg(alpha, alpha_mode),
@@ -288,7 +303,7 @@ def gemm(
         tile_count_semaphore,
         batch_idx_permute,
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, expert_ready_flags)
 
     if device_capacity[0] in [10, 11]:
         compiled_fn(
