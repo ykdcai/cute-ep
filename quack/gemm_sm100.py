@@ -24,8 +24,8 @@ from cutlass.cute.nvgpu.warp import (
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from quack.cute_dsl_utils import nanosleep
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
+from quack.tilepipe_sync import ExpertArrivalSemaphore
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -1097,23 +1097,8 @@ class GemmSm100(GemmTmaBase):
                     # expert (flag counts arrived tokens; target is the
                     # expert's segment length) before issuing any TMA load.
                     if batch_idx != ready_batch_idx:
-                        # Poll from a single lane: redundant sys-scope atomics
-                        # from all 32 lanes would serialize at the L2 atomic
-                        # unit and contend with dispatch's increments on the
-                        # same line. Only the TMA-issuing thread needs the
-                        # acquire; sync_warp holds the other lanes back.
-                        if cute.arch.lane_idx() == 0:
-                            flag_ptr = varlen_params.mReadyFlags.iterator + batch_idx
-                            target = varlen_manager.len_m(batch_idx)
-                            arrived = cute.arch.atomic_add(
-                                flag_ptr, Int32(0), sem="acquire", scope="sys"
-                            )
-                            while arrived < target:
-                                nanosleep(256)
-                                arrived = cute.arch.atomic_add(
-                                    flag_ptr, Int32(0), sem="acquire", scope="sys"
-                                )
-                        cute.arch.sync_warp()
+                        sem = ExpertArrivalSemaphore(flags=varlen_params.mReadyFlags)
+                        sem.wait_warp(batch_idx, varlen_manager.len_m(batch_idx))
                         ready_batch_idx = batch_idx
                 # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
