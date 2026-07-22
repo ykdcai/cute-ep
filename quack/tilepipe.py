@@ -354,6 +354,9 @@ class TilePipe:
         tile_n=128,
         comm_warps=16,
         publish="segment",   # "segment" or "token" flag granularity
+        copy_engine="simt",  # "simt" (warp 256-bit copies) or "tma" (bulk async)
+        tma_stages=12,       # SMEM stage budget for copy_engine="tma"
+        tma_workers=4,       # producer/consumer warp pairs per dispatch CTA
         warmup_comm_sms=8,
         log=None,            # callable for stage prints (hang diagnostics)
     ):
@@ -369,6 +372,11 @@ class TilePipe:
         self.tile_m, self.tile_n = tile_m, tile_n
         self.comm_warps = comm_warps
         self.publish = publish
+        self.copy_engine = copy_engine
+        assert copy_engine in ("simt", "tma")
+        if copy_engine == "tma":
+            assert publish == "segment", "TMA dispatch publishes per segment only"
+            assert input_data.dtype == torch.bfloat16
         log = log or (lambda msg: None)
         self._freed = False
 
@@ -442,11 +450,24 @@ class TilePipe:
         # Token-dependent dims are marked dynamic so the compiled kernel is
         # reusable across token counts (from_dlpack shapes are static by
         # default and would otherwise force a re-specialization).
-        log(f"compiling dispatch kernel (publish={publish})...")
-        self._compiled_dispatch = cute.compile(
-            tilepipe_dispatch, *self._dispatch_args(), Int32(warmup_comm_sms),
-            comm_warps, rank, world_size, publish == "segment",
-            cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        log(f"compiling dispatch kernel (copy={copy_engine} publish={publish})...")
+        if copy_engine == "tma":
+            # The TMA dispatch kernel lives with the other comm kernels in
+            # examples/distributed/moe_comm.py (alongside CombineTmaKernel).
+            from moe_comm import DispatchTmaKernel
+
+            self._tma_kernel = DispatchTmaKernel(
+                cutlass.BFloat16, hidden, num_stages=tma_stages,
+                workers=tma_workers)
+            self._compiled_dispatch = cute.compile(
+                self._tma_kernel, *self._dispatch_args_tma(),
+                Int32(warmup_comm_sms), rank, world_size,
+                cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        else:
+            self._compiled_dispatch = cute.compile(
+                tilepipe_dispatch, *self._dispatch_args(), Int32(warmup_comm_sms),
+                comm_warps, rank, world_size, publish == "segment",
+                cuda.CUstream(torch.cuda.current_stream().cuda_stream))
         log("dispatch kernel compiled")
 
         # --- Warm-up: EXECUTE every kernel before any overlapped run ---
@@ -499,11 +520,27 @@ class TilePipe:
             from_dlpack(self._seg_sizes), Int32(self.total_sends), Int32(self.hidden),
             Int32(self.max_recv_tokens))
 
+    def _dispatch_args_tma(self):
+        dyn2d = lambda t: from_dlpack(t, assumed_align=32).mark_layout_dynamic(leading_dim=1)
+        dyn1d = lambda t: from_dlpack(t).mark_layout_dynamic(leading_dim=0)
+        return (
+            dyn2d(self.input_buf), from_dlpack(self._recv_peer_ptrs),
+            from_dlpack(self._flag_peer_ptrs),
+            dyn1d(self._send_token), dyn1d(self._send_slot), dyn1d(self._send_dst),
+            dyn1d(self._send_seg), from_dlpack(self.seg_done),
+            from_dlpack(self._seg_sizes), Int32(self.total_sends),
+            Int32(self.max_recv_tokens))
+
     def launch_dispatch(self, num_ctas, stream=None):
         stream = stream if stream is not None else self.comm_stream
-        self._compiled_dispatch(
-            *self._dispatch_args(), Int32(num_ctas),
-            cuda.CUstream(stream.cuda_stream))
+        if self.copy_engine == "tma":
+            self._compiled_dispatch(
+                *self._dispatch_args_tma(), Int32(num_ctas),
+                cuda.CUstream(stream.cuda_stream))
+        else:
+            self._compiled_dispatch(
+                *self._dispatch_args(), Int32(num_ctas),
+                cuda.CUstream(stream.cuda_stream))
 
     def launch_gemm(self, gated, max_clusters=None, stream=None):
         with torch.cuda.stream(stream if stream is not None else self.gemm_stream):

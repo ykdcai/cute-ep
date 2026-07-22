@@ -38,7 +38,10 @@ import cutlass.cute.testing as testing
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import Int32
+import cuda.bindings.driver as cuda_driver
 from cuda.core import Device
+
+from quack.tilepipe_sync import ExpertArrivalSemaphore
 
 import nvshmem.core
 
@@ -648,6 +651,282 @@ class CombineTmaKernel:
                     _per_thread_view(
                         out_tile, vec_size, CONSUMER_THREADS, ctid).store(accum.load())
                 token += cta_nums
+
+
+# ---------------------------------------------------------------------------
+# TMA-bulk dispatch: SM-efficient variant (CombineTmaKernel's machinery with
+# the direction inverted: local G2S gather -> remote S2G push).
+# ---------------------------------------------------------------------------
+# The SIMT dispatch is issue-limited (~20-30 GB/s per SM); the first TMA
+# version measured ~14 GB/s/SM, flat in CTA count — a per-row LATENCY
+# ceiling on its single worker thread (scalar metadata loads + mbarrier
+# handshakes + a stage-recycle wait that was wrongly coupled to remote WRITE
+# completion). v3 attacks all three:
+#
+#   - WORKERS independent pipelines per CTA, each owning a contiguous
+#     sub-block of the send list, a private SMEM stage partition, and private
+#     bulk-group state (cp.async.bulk groups are PER-THREAD — this is the
+#     warp specialization that works; a dedicated flag warp cannot observe
+#     another thread's S2G completion, and the publish is one atomic per
+#     segment anyway).
+#   - Per worker, PRODUCER and CONSUMER are separate warps (combine-kernel
+#     structure): the producer thread streams G2S (only needs send_token),
+#     the consumer thread waits stages, reads slot/dst/seg, issues S2G, and
+#     publishes. Their fixed per-row overheads overlap instead of
+#     serializing, and a backpressure stall on one side no longer drains the
+#     other.
+#   - Stage recycling is gated on the S2G's SMEM READ only
+#     (wait_group(read=True), ~free); remote WRITE completion is tracked
+#     separately with a wide window that defines the publish watermark.
+#
+# Publish ordering (consumer thread): S2G stores are ASYNC-PROXY writes, so
+# a segment is published only once the write watermark has passed its last
+# row, and always behind fence.proxy.async before the generic-proxy release
+# (else the flag can beat the data). Boundaries record a pending
+# (segment, count, row); tiny segments (two boundaries inside one window)
+# fall back to a hard drain. The counting protocol is arrival-order-
+# agnostic, so workers/CTAs sharing a boundary segment is fine.
+
+
+@cute.jit
+def _publish_segment_tma(
+    seg: Int32,
+    count: Int32,
+    seg_done: cute.Tensor,
+    seg_sizes: cute.Tensor,
+    flag_peer_ptrs: cute.Tensor,
+    local_rank: cutlass.Constexpr,
+    world_size: cutlass.Constexpr,
+):
+    # Caller must have ensured this thread's S2G writes for the segment are
+    # complete (wait_group) AND fenced (fence.proxy.async). Single-thread.
+    old = cute.arch.atomic_add(
+        seg_done.iterator + seg, count, sem="acq_rel", scope="sys")
+    seg_size = seg_sizes[seg]
+    if old + count == seg_size:
+        e = seg // world_size
+        dst = (seg % world_size + local_rank) % world_size
+        sem = ExpertArrivalSemaphore(peer_ptrs=flag_peer_ptrs)
+        sem.arrive(dst, e, seg_size)
+
+
+class DispatchTmaKernel:
+    """WORKERS producer/consumer warp pairs per CTA, each running a private
+    (num_stages // workers)-deep bulk pipeline over a contiguous sub-block of
+    the send list. hidden is compile-time (SMEM stage size)."""
+
+    WRITE_WINDOW = 8  # in-flight remote writes per worker (publish watermark)
+
+    def __init__(self, dtype, hidden, num_stages: int = 12, workers: int = 4):
+        self.dtype = dtype
+        self.hidden = hidden
+        self.NUM_STAGES = num_stages
+        self.WORKERS = workers
+        assert num_stages % workers == 0, "num_stages must divide by workers"
+        assert num_stages // workers >= 2, "each worker needs >=2 stages"
+        row_bytes = hidden * dtype.width // 8
+        assert row_bytes % 16 == 0, "bulk copy needs 16B-aligned rows"
+        self.tx_count = row_bytes
+        stages = num_stages
+        elems = hidden
+
+        @cute.struct
+        class SharedStorage:
+            mbar_array: cute.struct.MemRange[cutlass.Int64, stages * 2]
+            smem_buffer: cute.struct.Align[
+                cute.struct.MemRange[dtype, elems * stages], 128
+            ]
+
+        self._SharedStorage = SharedStorage
+
+    @cute.jit
+    def __call__(
+        self,
+        input_buf: cute.Tensor,       # [num_tokens, hidden] local token data
+        recv_peer_ptrs: cute.Tensor,  # [world] int64
+        flag_peer_ptrs: cute.Tensor,  # [world] int64
+        send_token: cute.Tensor,      # [total_sends] int32
+        send_slot: cute.Tensor,       # [total_sends] int32
+        send_dst: cute.Tensor,        # [total_sends] int32
+        send_seg: cute.Tensor,        # [total_sends] int32
+        seg_done: cute.Tensor,        # [num_segs] int32
+        seg_sizes: cute.Tensor,       # [num_segs] int32
+        total_sends: Int32,
+        max_recv_tokens: Int32,
+        num_ctas: Int32,
+        local_rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
+        stream: cuda_driver.CUstream,
+    ):
+        in_total = cute.size(input_buf.layout)
+        in_flat = cute.make_tensor(input_buf.iterator, cute.make_layout((in_total,)))
+        self.kernel(
+            in_flat, recv_peer_ptrs, flag_peer_ptrs,
+            send_token, send_slot, send_dst, send_seg, seg_done, seg_sizes,
+            total_sends, max_recv_tokens, local_rank, world_size,
+        ).launch(
+            grid=[num_ctas, 1, 1],
+            block=[self.WORKERS * 64, 1, 1],  # producer warp + consumer warp each
+            smem=self._SharedStorage.size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        in_flat: cute.Tensor,
+        recv_peer_ptrs: cute.Tensor,
+        flag_peer_ptrs: cute.Tensor,
+        send_token: cute.Tensor,
+        send_slot: cute.Tensor,
+        send_dst: cute.Tensor,
+        send_seg: cute.Tensor,
+        seg_done: cute.Tensor,
+        seg_sizes: cute.Tensor,
+        total_sends: Int32,
+        max_recv_tokens: Int32,
+        local_rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        bidx = cute.arch.block_idx()[0]
+        gdim = cute.arch.grid_dim()[0]
+        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_id = tidx % 32
+        WORKERS = cutlass.const_expr(self.WORKERS)
+        SPW = cutlass.const_expr(self.NUM_STAGES // self.WORKERS)
+        WWIN = cutlass.const_expr(self.WRITE_WINDOW)
+        hidden = cutlass.const_expr(self.hidden)
+        tiler = (hidden,)
+
+        smem = cute_utils.SmemAllocator()
+        storage = smem.allocate(self._SharedStorage)
+        staged_all = storage.smem_buffer.get_tensor(
+            cute.make_layout((hidden, self.NUM_STAGES)))
+        mbar_base = storage.mbar_array.data_ptr()
+        # One private pipeline per worker (created by all threads: create()
+        # includes the block-wide init sync).
+        pipes = []
+        for w in cutlass.range_constexpr(WORKERS):
+            pipes.append(pipeline.PipelineTmaAsync.create(
+                barrier_storage=mbar_base + w * SPW * 2,
+                num_stages=SPW,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                tx_count=self.tx_count,
+                cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+            ))
+
+        src_tiled = cute.zipped_divide(in_flat, tiler)
+        g2s_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), self.dtype)
+        s2g_atom = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), self.dtype)
+
+        for w in cutlass.range_constexpr(WORKERS):
+            # Contiguous sub-block for worker w of this CTA.
+            num_workers_total = gdim * WORKERS
+            wid = bidx * WORKERS + w
+            per_w = (total_sends + num_workers_total - 1) // num_workers_total
+            block_start = wid * per_w
+            n = total_sends - block_start
+            if n > per_w:
+                n = per_w
+            if n < 0:
+                n = Int32(0)
+            staged = cute.make_tensor(
+                staged_all.iterator + w * SPW * hidden,
+                cute.make_layout((hidden, SPW)))
+
+            if warp_id == w:
+                # ---- Producer warp: stream rows into SMEM stages. ----
+                if lane_id == 0:
+                    prod = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, SPW)
+                    for i in range(n):
+                        pipes[w].producer_acquire(prod)
+                        tok = send_token[block_start + i]
+                        s_tile = cute.slice_(staged, (None, prod.index))
+                        g_tile = src_tiled[(None,), tok]
+                        cute.copy(g2s_atom, g_tile, s_tile,
+                                  mbar_ptr=pipes[w].producer_get_barrier(prod))
+                        pipes[w].producer_commit(prod)
+                        prod.advance()
+
+            if warp_id == WORKERS + w:
+                # ---- Consumer warp: push staged rows to the destination,
+                # recycle stages on SMEM-read completion, publish segments
+                # behind the write watermark. ----
+                if lane_id == 0:
+                    cons = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, SPW)
+                    rel = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, SPW)
+                    cur_seg = Int32(-1)
+                    count = Int32(0)
+                    pend_seg = Int32(-1)
+                    pend_count = Int32(0)
+                    pend_row = Int32(0)
+                    for i in range(n):
+                        pipes[w].consumer_wait(cons)  # row i staged
+
+                        seg = send_seg[block_start + i]
+                        if seg != cur_seg:
+                            if count > 0:
+                                if pend_seg >= 0:
+                                    # Two boundaries inside one write window
+                                    # (tiny segments): hard-drain the older.
+                                    cute.arch.cp_async_bulk_wait_group(0)
+                                    cute.arch.fence_proxy("async")
+                                    _publish_segment_tma(
+                                        pend_seg, pend_count, seg_done,
+                                        seg_sizes, flag_peer_ptrs,
+                                        local_rank, world_size)
+                                pend_seg = cur_seg
+                                pend_count = count
+                                pend_row = i - 1
+                            cur_seg = seg
+                            count = Int32(0)
+
+                        slot = send_slot[block_start + i]
+                        dst = send_dst[block_start + i]
+                        r_ptr = cute.make_ptr(
+                            self.dtype, recv_peer_ptrs[dst],
+                            cute.AddressSpace.gmem, assumed_align=16)
+                        r_flat = cute.make_tensor(
+                            r_ptr, cute.make_layout((max_recv_tokens * hidden,)))
+                        d_tile = cute.zipped_divide(r_flat, tiler)[(None,), slot]
+                        s_tile = cute.slice_(staged, (None, cons.index))
+                        cute.copy(s2g_atom, s_tile, d_tile)
+                        cute.arch.cp_async_bulk_commit_group()
+                        # Recycle the previous stage as soon as its SMEM read
+                        # is done (cheap); remote writes stay in flight.
+                        cute.arch.cp_async_bulk_wait_group(1, read=True)
+                        if i >= 1:
+                            pipes[w].consumer_release(rel)
+                            rel.advance()
+                        # Bound in-flight writes; rows <= i - WWIN complete.
+                        cute.arch.cp_async_bulk_wait_group(WWIN)
+                        if pend_seg >= 0:
+                            if pend_row <= i - WWIN:
+                                cute.arch.fence_proxy("async")
+                                _publish_segment_tma(
+                                    pend_seg, pend_count, seg_done, seg_sizes,
+                                    flag_peer_ptrs, local_rank, world_size)
+                                pend_seg = Int32(-1)
+                        cons.advance()
+                        count += 1
+
+                    # Tail: drain everything, publish what's left.
+                    if n > 0:
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        cute.arch.fence_proxy("async")
+                        if pend_seg >= 0:
+                            _publish_segment_tma(
+                                pend_seg, pend_count, seg_done, seg_sizes,
+                                flag_peer_ptrs, local_rank, world_size)
+                        if count > 0:
+                            _publish_segment_tma(
+                                cur_seg, count, seg_done, seg_sizes,
+                                flag_peer_ptrs, local_rank, world_size)
 
 
 # ---------------------------------------------------------------------------
@@ -1519,6 +1798,134 @@ def autotune_combine_tma(*, peer_output_tensors, combine_cute, combine_output_bu
               f"({knee[2]/knee[0]:.2f} GB/s/SM)")
 
 
+def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
+                     ctas_list, num_stages, workers,
+                     warmup_iterations, iterations):
+    """Standalone correctness test + CTA-sweep benchmark for
+    DispatchTmaKernel (TilePipe-style host-precomputed send list, counting-
+    semaphore publish). Reports GB/s and GB/s-per-SM so the SM-efficiency
+    claim vs the SIMT dispatch is directly checkable."""
+    from quack.tilepipe import build_send_arrays, build_recv_metadata
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.cuda.current_device()
+    epr = num_experts // world_size
+    torch.manual_seed(42 + rank)
+    if rank == 0:
+        print(f"\nTMA dispatch test: tokens/rank={num_tokens} hidden={hidden} "
+              f"experts={num_experts} topk={topk} stages={num_stages} "
+              f"workers={workers} world={world_size}", flush=True)
+
+    topk_indices = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
+    input_data = (torch.randn((num_tokens, hidden), dtype=torch.bfloat16,
+                              device=device) / hidden ** 0.5)
+    all_topk_t = [torch.zeros_like(topk_indices) for _ in range(world_size)]
+    dist.all_gather(all_topk_t, topk_indices.contiguous())
+    all_topk = np.stack([t.cpu().numpy() for t in all_topk_t])
+
+    tok, slot, dst_, el, seg, seg_sizes_np = build_send_arrays(
+        all_topk, num_experts, rank, world_size)
+    split_sizes, cu_seqlens, max_recv = build_recv_metadata(
+        all_topk, num_experts, rank, world_size)
+    total_sends = len(tok)
+    total_m = int(cu_seqlens[-1])
+
+    input_buf = nvshmem.core.tensor((num_tokens, hidden), dtype=torch.bfloat16)
+    input_buf.copy_(input_data)
+    recv_buf = nvshmem.core.tensor((max_recv, hidden), dtype=torch.bfloat16)
+    recv_buf.fill_(0)
+    flags = nvshmem.core.tensor((epr,), dtype=torch.int32)
+    flags.fill_(0)
+    recv_peer_ptrs = _peer_ptr_tensor(recv_buf, world_size, device)
+    flag_peer_ptrs = _peer_ptr_tensor(flags, world_size, device)
+
+    dev = lambda a: torch.from_numpy(a).to(device)
+    send_token, send_slot, send_dst, send_seg = (
+        dev(tok), dev(slot), dev(dst_), dev(seg))
+    seg_sizes_t = dev(seg_sizes_np)
+    seg_done = torch.zeros(len(seg_sizes_np), dtype=torch.int32, device=device)
+    split_sizes_t = dev(split_sizes.astype(np.int32))
+
+    kern = DispatchTmaKernel(cutlass.BFloat16, hidden,
+                             num_stages=num_stages, workers=workers)
+    dyn1d = lambda t: from_dlpack(t).mark_layout_dynamic(leading_dim=0)
+    kargs = lambda: (
+        from_dlpack(input_buf, assumed_align=32).mark_layout_dynamic(leading_dim=1),
+        from_dlpack(recv_peer_ptrs), from_dlpack(flag_peer_ptrs),
+        dyn1d(send_token), dyn1d(send_slot), dyn1d(send_dst), dyn1d(send_seg),
+        from_dlpack(seg_done), from_dlpack(seg_sizes_t),
+        Int32(total_sends), Int32(max_recv))
+    stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(kern, *kargs(), Int32(ctas_list[0]),
+                            rank, world_size, stream)
+    print(f"[rank {rank}] TMA dispatch kernel compiled "
+          f"(smem={kern._SharedStorage.size_in_bytes() / 1024:.0f} KB)", flush=True)
+
+    def reset():
+        flags.fill_(0)
+        seg_done.zero_()
+        torch.cuda.synchronize()
+        dist.barrier(device_ids=[rank])
+
+    def launch(num_ctas):
+        compiled(*kargs(), Int32(num_ctas), stream)
+
+    # Correctness (also the warm-up execution): flags land on split_sizes,
+    # recv rows bit-exact against the deterministic slot assignment.
+    reset()
+    launch(ctas_list[0])
+    torch.cuda.synchronize()
+    dist.barrier(device_ids=[rank])
+    all_inputs = [torch.zeros_like(input_data) for _ in range(world_size)]
+    dist.all_gather(all_inputs, input_data.contiguous())
+    recv_ref = torch.zeros((total_m, hidden), dtype=torch.bfloat16, device=device)
+    for src in range(world_size):
+        tok_s, slot_s, dst_s, _, _, _ = build_send_arrays(
+            all_topk, num_experts, src, world_size)
+        mine = dst_s == rank
+        recv_ref[dev(slot_s[mine]).long()] = all_inputs[src][dev(tok_s[mine]).long()]
+    ok_flags = torch.equal(flags.cpu(), split_sizes_t.cpu())
+    ok_recv = torch.equal(recv_buf[:total_m], recv_ref)
+    print(f"[rank {rank}] TMA dispatch correctness: "
+          f"flags={'OK' if ok_flags else 'FAIL ' + str(flags.cpu().tolist()[:8])} "
+          f"recv={'OK' if ok_recv else 'FAIL'}", flush=True)
+    ok_t = torch.tensor([ok_flags and ok_recv], dtype=torch.int32, device=device)
+    dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
+    if not bool(ok_t.item()):
+        raise SystemExit(f"[rank {rank}] TMA dispatch correctness FAILED")
+
+    # Benchmark: CTA sweep, median over iterations, slowest rank counts.
+    send_bytes = total_sends * hidden * 2
+    if rank == 0:
+        print(f"\nTMA dispatch benchmark ({send_bytes / 1e6:.0f} MB pushed/rank)")
+        print(f"{'ctas':>6} {'time':>10} {'GB/s':>8} {'GB/s/SM':>9}")
+    for ctas in ctas_list:
+        times = []
+        for it in range(warmup_iterations + iterations):
+            reset()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            launch(ctas)
+            end.record()
+            torch.cuda.synchronize()
+            if it >= warmup_iterations:
+                times.append(start.elapsed_time(end))
+        t = torch.tensor([float(np.median(times))], device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        t_ms = t.item()
+        if rank == 0:
+            gbps = send_bytes / t_ms / 1e6
+            print(f"{ctas:>6} {t_ms:>8.3f}ms {gbps:>8.0f} {gbps / ctas:>9.1f}",
+                  flush=True)
+
+    nvshmem.core.free_tensor(input_buf)
+    nvshmem.core.free_tensor(recv_buf)
+    nvshmem.core.free_tensor(flags)
+
+
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
         warmup_iterations=10, iterations=100, save_baseline_to=None,
         bench_only="both", combine_cta_nums=148, combine_num_warps=32,
@@ -1596,6 +2003,22 @@ def main():
                            "(hchunk, stages) itself -- so --combine-cta-nums, "
                            "--tma-hchunk and --tma-stages are ignored in this mode.")
 
+    # -- TilePipe TMA dispatch (self-contained test + benchmark mode) --
+    td = parser.add_argument_group("tma-dispatch")
+    td.add_argument("--test-tma-dispatch", action="store_true",
+                    help="Run only the TilePipe DispatchTmaKernel correctness "
+                         "test + CTA-sweep benchmark (GB/s per SM), then exit. "
+                         "Uses --num_tokens/--hidden/--num_experts/--topk and "
+                         "the iteration counts.")
+    td.add_argument("--dispatch-ctas", default="1,2,4,8,16,32",
+                    help="[tma-dispatch] comma-separated CTA counts to sweep.")
+    td.add_argument("--dispatch-tma-stages", default=12, type=int,
+                    help="[tma-dispatch] SMEM stage budget (14 KB each at "
+                         "hidden=7168).")
+    td.add_argument("--dispatch-tma-workers", default=4, type=int,
+                    help="[tma-dispatch] producer/consumer warp pairs per CTA, "
+                         "each with a private stage partition and sub-block.")
+
     parser.add_argument("--save-baseline-to", default=None,
                         help="If set, rank 0 saves output_buf + combine_output_buf "
                              "(plus indices and shape constants) as a .npz file at "
@@ -1603,6 +2026,22 @@ def main():
                              "check_combine pass. A subsequent run can compare "
                              "against this file to verify bit-identity.")
     args = parser.parse_args()
+
+    if args.test_tma_dispatch:
+        torchrun_uid_init_bcast()
+        try:
+            run_tma_dispatch(
+                args.num_tokens, args.hidden, args.num_experts, args.topk,
+                ctas_list=[int(x) for x in args.dispatch_ctas.split(",")],
+                num_stages=args.dispatch_tma_stages,
+                workers=args.dispatch_tma_workers,
+                warmup_iterations=args.warmup_iterations,
+                iterations=args.iterations)
+        finally:
+            torch.cuda.synchronize()
+            dist.barrier()
+            torchrun_finalize()
+        return
 
     run(args.num_tokens, args.hidden, args.num_experts, args.topk,
         benchmark=args.benchmark,

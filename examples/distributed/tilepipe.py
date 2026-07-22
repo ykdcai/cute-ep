@@ -111,6 +111,9 @@ def run_tilepipe(args):
         tile_n=args.tile_n,
         comm_warps=args.comm_warps,
         publish=args.publish,
+        copy_engine=args.copy,
+        tma_stages=args.tma_stages,
+        tma_workers=args.tma_workers,
         warmup_comm_sms=args.comm_sms_list[0],
         log=lambda msg: print(f"[rank {rank}] {msg}"),
     )
@@ -231,12 +234,21 @@ def main():
     parser.add_argument("--tile-m", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=128)
     parser.add_argument("--comm-warps", type=int, default=16)
+    parser.add_argument("--copy", choices=["simt", "tma"], default="simt",
+                        help="dispatch copy engine: warp 256-bit SIMT copies, or "
+                             "TMA bulk async (1 warp/CTA, SMEM-staged pipeline; "
+                             "much higher per-SM bandwidth)")
+    parser.add_argument("--tma-stages", type=int, default=12,
+                        help="SMEM stage budget for --copy tma")
+    parser.add_argument("--tma-workers", type=int, default=4,
+                        help="producer/consumer warp pairs per dispatch CTA "
+                             "for --copy tma")
     parser.add_argument("--publish", choices=["token", "segment"], default="segment",
                         help="flag granularity: per token, or one release per "
                              "(source, expert) segment via local completion counters")
     parser.add_argument("--comm-sms", type=str, default="8,16,24,32",
                         help="comma-separated num_comm_sms values to sweep")
-    parser.add_argument("--oversub-sms", type=str, default="8,16,24",
+    parser.add_argument("--oversub-sms", type=str, default="0",
                         help="comma-separated GEMM SM oversubscription values to "
                              "sweep: gemm clusters = min(num_sms, num_sms + oversub "
                              "- comm_sms), so the GEMM backfills dispatch's SMs "
