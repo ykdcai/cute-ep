@@ -1693,6 +1693,33 @@ class GemmSm100(GemmTmaBase):
                 acc_consumer_state.advance()
                 tctx.e("epilogue")
 
+                # TilePipe (GEMM->combine): publish this work tile's completion
+                # to every rank's tile-flag array. The D stores are async-proxy
+                # (TMA) writes, so the TMA warp first drains its outstanding
+                # store groups, then fences the proxy boundary, then one lane
+                # bumps flag[offsets[b] + m_tile] on each rank (release/sys).
+                # Consumers treat a row block as ready when the counter hits
+                # the N-tile count.
+                if const_expr(varlen_params.mTileFlagPtrs is not None):
+                    if is_tma_warp:
+                        epi_store_pipeline.producer_tail()
+                        cute.arch.fence_proxy("async")
+                        if cute.arch.lane_idx() == 0:
+                            flag_idx = (
+                                varlen_params.mTileOffsets[batch_idx] + tile_coord_mnkl[0]
+                            )
+                            num_ranks = cute.size(varlen_params.mTileFlagPtrs.shape)
+                            for r in cutlass.range(num_ranks):
+                                flag_ptr = cute.make_ptr(
+                                    Int32,
+                                    varlen_params.mTileFlagPtrs[r],
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=4,
+                                )
+                                cute.arch.atomic_add(
+                                    flag_ptr + flag_idx, Int32(1), sem="release", scope="sys"
+                                )
+
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
