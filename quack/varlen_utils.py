@@ -21,6 +21,13 @@ class VarlenArguments(NamedTuple):
     # (varlen_m only), the AB load warps wait until mReadyFlags[b] reaches the
     # batch's segment length before issuing any TMA load for batch b.
     mReadyFlags: Optional[cute.Tensor] = None
+    # TilePipe (GEMM->combine): tile-completion publish. When set (varlen_m
+    # only), the epilogue TMA warp bumps flag[mTileOffsets[b] + m_tile] by 1
+    # on EVERY rank (mTileFlagPtrs = int64[world] peer base addrs) after the
+    # work tile's D stores complete; a row block is ready when its counter
+    # reaches the number of N tiles.
+    mTileFlagPtrs: Optional[cute.Tensor] = None
+    mTileOffsets: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -30,6 +37,8 @@ class VarlenManager:
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
         mReadyFlags: Optional[cute.Tensor] = None
+        mTileFlagPtrs: Optional[cute.Tensor] = None
+        mTileOffsets: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -39,6 +48,8 @@ class VarlenManager:
                 cu_seqlens_k=args.mCuSeqlensK,
                 mAIdx=args.mAIdx,
                 mReadyFlags=args.mReadyFlags,
+                mTileFlagPtrs=args.mTileFlagPtrs,
+                mTileOffsets=args.mTileOffsets,
             )
 
     def __init__(

@@ -27,6 +27,7 @@ To run:
 
 import os
 import argparse
+from typing import Optional
 import functools
 
 import numpy as np
@@ -41,6 +42,7 @@ from cutlass.cutlass_dsl import Int32
 import cuda.bindings.driver as cuda_driver
 from cuda.core import Device
 
+from quack.cute_dsl_utils import nanosleep
 from quack.tilepipe_sync import ExpertArrivalSemaphore
 
 import nvshmem.core
@@ -531,6 +533,13 @@ class CombineTmaKernel:
         local_rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         cta_nums: cutlass.Constexpr,
+        # TilePipe GEMM->combine gate (all-or-none): local mirror of every
+        # producer's tile-completion counters, the host-precomputed flat flag
+        # index per (token, j) (producer-rank offset included), and the
+        # per-m-tile readiness target ceil(N / tile_N).
+        tile_flags: Optional[cute.Tensor] = None,
+        flag_idx: Optional[cute.Tensor] = None,
+        n_tiles: Optional[Int32] = None,
     ):
         # Raw 1D cp.async.bulk: each peer buffer is just flattened to 1D; the
         # producer slices a contiguous HCHUNK run by tile id. No TMA descriptor.
@@ -547,6 +556,7 @@ class CombineTmaKernel:
             peer_flat, out_flat,
             topk_indices, scatter_idx, num_input_tokens,
             experts_per_rank, local_rank, world_size, cta_nums,
+            tile_flags, flag_idx, n_tiles,
         ).launch(
             grid=[cta_nums, 1, 1],
             block=[self.threads_per_cta, 1, 1],
@@ -565,6 +575,9 @@ class CombineTmaKernel:
         local_rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         cta_nums: cutlass.Constexpr,
+        tile_flags: Optional[cute.Tensor] = None,
+        flag_idx: Optional[cute.Tensor] = None,
+        n_tiles: Optional[Int32] = None,
     ):
         tidx = cute.arch.thread_idx()[0]
         bidx = cute.arch.block_idx()[0]
@@ -599,6 +612,7 @@ class CombineTmaKernel:
             bulk_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), self.dtype)
             prod = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.NUM_STAGES)
+            last_flag_idx = Int32(-1)
             token = bidx
             while token < num_tokens:
                 for k in cutlass.range_constexpr(num_chunks):
@@ -607,6 +621,17 @@ class CombineTmaKernel:
                         rank_j = expert_idx // experts_per_rank
                         slot_j = scatter_idx[token, j]
                         tile_id = slot_j * num_chunks + k
+                        if cutlass.const_expr(tile_flags is not None and k == 0):
+                            # TilePipe gate, once per source row: wait until
+                            # the producing GEMM's m-tile counter reaches the
+                            # N-tile count. wait_warp = elected-lane acquire
+                            # poll + sync_warp + fence.proxy.async (the pull
+                            # below reads through the async proxy).
+                            fidx = flag_idx[token, j]
+                            if fidx != last_flag_idx:
+                                gate = ExpertArrivalSemaphore(flags=tile_flags)
+                                gate.wait_warp(fidx, n_tiles)
+                                last_flag_idx = fidx
                         tma_pipeline.producer_acquire(prod)
                         s_tile = cute.slice_(staged, (None, prod.index))
                         for r in cutlass.range_constexpr(world_size):
@@ -651,6 +676,72 @@ class CombineTmaKernel:
                     _per_thread_view(
                         out_tile, vec_size, CONSUMER_THREADS, ctid).store(accum.load())
                 token += cta_nums
+
+
+# ---------------------------------------------------------------------------
+# TilePipe GEMM->combine gating support: tile-trickle producer emulator for
+# the gated-combine test (the gate itself lives inside CombineTmaKernel via
+# the optional tile_flags/flag_idx/n_tiles arguments).
+# ---------------------------------------------------------------------------
+
+
+@cute.kernel
+def _tile_trickle_kernel(
+    src: cute.Tensor,             # [rows, hidden] the data tiles should contain
+    dst: cute.Tensor,             # [rows, hidden] expert-output buffer (starts garbage)
+    flag_peer_ptrs: cute.Tensor,  # [world] int64: peer tile-flag base addrs
+    flag_base: Int32,             # local_rank * tiles_per_rank
+    rows: Int32,
+    n_tiles_target: Int32,        # value to publish per tile (= N-tile count)
+    delay_iters: cutlass.Constexpr,
+    tile_m: cutlass.Constexpr,
+    world_size: cutlass.Constexpr,
+):
+    """Emulates the GEMM producer for the gated-combine test: fills the
+    expert-output buffer tile by tile (data BEFORE flag, release/sys), so the
+    combine's output is correct only if its gate actually waits."""
+    tidx, _, _ = cute.arch.thread_idx()
+    bdim, _, _ = cute.arch.block_dim()
+    hidden = cute.size(src, mode=[1])
+    num_m_tiles = (rows + tile_m - 1) // tile_m
+    for t in range(num_m_tiles):
+        lo = t * tile_m
+        hi = lo + tile_m
+        if hi > rows:
+            hi = rows
+        # Cooperative fill of this tile's rows.
+        for row in range(lo, hi):
+            for h in range(tidx, hidden, bdim):
+                dst[row, h] = src[row, h]
+        cute.arch.barrier()
+        if tidx == 0:
+            for _ in cutlass.range(delay_iters):
+                nanosleep(1024)
+            for r in cutlass.range(world_size):
+                flag_ptr = cute.make_ptr(
+                    Int32, flag_peer_ptrs[r], cute.AddressSpace.gmem, assumed_align=4)
+                cute.arch.atomic_add(
+                    flag_ptr + flag_base + t, n_tiles_target, sem="release", scope="sys")
+        cute.arch.barrier()
+
+
+@cute.jit
+def _tile_trickle_launch(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    flag_peer_ptrs: cute.Tensor,
+    flag_base: Int32,
+    rows: Int32,
+    n_tiles_target: Int32,
+    delay_iters: cutlass.Constexpr,
+    tile_m: cutlass.Constexpr,
+    world_size: cutlass.Constexpr,
+    stream: cuda_driver.CUstream,
+):
+    _tile_trickle_kernel(
+        src, dst, flag_peer_ptrs, flag_base, rows, n_tiles_target,
+        delay_iters, tile_m, world_size,
+    ).launch(grid=[1, 1, 1], block=[256, 1, 1], stream=stream)
 
 
 # ---------------------------------------------------------------------------
@@ -1798,6 +1889,226 @@ def autotune_combine_tma(*, peer_output_tensors, combine_cute, combine_output_bu
               f"({knee[2]/knee[0]:.2f} GB/s/SM)")
 
 
+def run_tma_combine(num_tokens, hidden, num_experts, topk,
+                    ctas_list, n_tiles_target, tma_cfg,
+                    warmup_iterations, iterations):
+    """Standalone test + benchmark for the gated CombineTmaKernel: expert outputs
+    are synthetic (per-rank seeded randn standing in for GEMM output), the
+    producer is emulated by a tile-trickle kernel that fills rows tile by
+    tile and publishes the counters data-before-flag — so a correct combine
+    output proves the gate actually waits. Benchmark compares gated (flags
+    pre-satisfied) against the ungated CombineTmaKernel."""
+    from quack.tilepipe import build_recv_metadata
+
+    TILE_M = 128
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.cuda.current_device()
+    epr = num_experts // world_size
+    torch.manual_seed(42 + rank)
+    if rank == 0:
+        print(f"\nGated TMA combine test: tokens/rank={num_tokens} hidden={hidden} "
+              f"experts={num_experts} topk={topk} n_tiles_target={n_tiles_target} "
+              f"world={world_size}", flush=True)
+
+    topk_indices = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
+    all_topk_t = [torch.zeros_like(topk_indices) for _ in range(world_size)]
+    dist.all_gather(all_topk_t, topk_indices.contiguous())
+    all_topk = np.stack([t.cpu().numpy() for t in all_topk_t])
+
+    # Deterministic recv-slot assignment (same rule as tilepipe dispatch):
+    # rows on rank d grouped by local expert, then source rank, then token
+    # order. scatter[t, j] = row of (t, j) in rank_j's expert-output buffer.
+    counts = np.zeros((world_size, num_experts), dtype=np.int64)
+    for r in range(world_size):
+        counts[r] = np.bincount(all_topk[r].reshape(-1), minlength=num_experts)
+    base = np.zeros((world_size, epr, world_size), dtype=np.int64)
+    for d in range(world_size):
+        c = 0
+        for e in range(epr):
+            for src in range(world_size):
+                base[d, e, src] = c
+                c += counts[src, d * epr + e]
+    topk_flat = all_topk[rank].reshape(-1)
+    dst = topk_flat // epr
+    el = topk_flat % epr
+    group = dst * epr + el
+    order = np.argsort(group, kind="stable")
+    sorted_group = group[order]
+    within = np.arange(len(order)) - np.searchsorted(sorted_group, sorted_group, "left")
+    slot = np.empty(len(order), dtype=np.int64)
+    slot[order] = base[dst[order], el[order], rank] + within
+    scatter_np = slot.reshape(num_tokens, topk)
+
+    # Per-rank tile geometry: rank d has split sizes per local expert;
+    # m-tiles per expert = ceil(len/128); rank_tile_base = cumsum of ranks'
+    # totals. flag_idx[t, j] fully precomputed (rank offset included).
+    per_rank_meta = [build_recv_metadata(all_topk, num_experts, d, world_size)
+                     for d in range(world_size)]
+    rank_rows = [int(m[1][-1]) for m in per_rank_meta]
+    tile_offsets = []
+    rank_tiles = []
+    for d in range(world_size):
+        split = per_rank_meta[d][0]
+        mt = (split + TILE_M - 1) // TILE_M
+        tile_offsets.append(np.concatenate([[0], np.cumsum(mt)])[:-1])
+        rank_tiles.append(int(mt.sum()))
+    rank_tile_base = np.concatenate([[0], np.cumsum(rank_tiles)])[:-1]
+    total_tiles = int(sum(rank_tiles))
+    cu_by_rank = [m[1] for m in per_rank_meta]
+    exp_of_slot = [np.searchsorted(cu_by_rank[d], np.arange(rank_rows[d]), "right") - 1
+                   for d in range(world_size)]
+    flag_idx_np = np.empty((num_tokens, topk), dtype=np.int64)
+    for t in range(num_tokens):
+        for j in range(topk):
+            d, s = int(dst[t * topk + j]), int(scatter_np[t, j])
+            b = int(exp_of_slot[d][s])
+            tile = int(tile_offsets[d][b] + (s - cu_by_rank[d][b]) // TILE_M)
+            flag_idx_np[t, j] = rank_tile_base[d] + tile
+    max_rows = max(max(rank_rows), 1)
+
+    # Synthetic expert outputs: rank d's buffer = seeded randn(d), so every
+    # rank can rebuild any peer's rows for the reference.
+    def rank_data(d):
+        g = torch.Generator(device=device)
+        g.manual_seed(1000 + d)
+        return torch.randn((max_rows, hidden), generator=g, device=device,
+                           dtype=torch.float32)
+
+    my_data = rank_data(rank)
+    expert_output_buf = nvshmem.core.tensor((max_rows, hidden), dtype=torch.float32)
+    expert_output_buf.copy_(my_data)
+    tile_flags = nvshmem.core.tensor((total_tiles,), dtype=torch.int32)
+    tile_flags.fill_(0)
+    flag_peer_ptrs = _peer_ptr_tensor(tile_flags, world_size, device)
+
+    combine_out = torch.zeros((num_tokens, hidden), dtype=torch.float32, device=device)
+    scatter_t = torch.from_numpy(scatter_np.astype(np.int32)).to(device)
+    flag_idx_t = torch.from_numpy(flag_idx_np.astype(np.int32)).to(device)
+    ntok_t = torch.full((world_size,), num_tokens, dtype=torch.int32, device=device)
+
+    # Reference: sum over topk of the owning rank's row.
+    ref = torch.zeros_like(combine_out)
+    for d in range(world_size):
+        data_d = my_data if d == rank else rank_data(d)
+        mask = torch.from_numpy((dst.reshape(num_tokens, topk) == d)).to(device)
+        idx = scatter_t.long().clamp(0, max_rows - 1)
+        ref += (data_d[idx] * mask.unsqueeze(-1)).sum(dim=1)
+        del data_d
+
+    peer_tensors = [from_dlpack(nvshmem.core.get_peer_tensor(expert_output_buf, r))
+                    for r in range(world_size)]
+    combine_kernel = CombineTmaKernel(cutlass.Float32, hidden, topk, **tma_cfg)
+    base_args = lambda: (
+        peer_tensors, from_dlpack(combine_out), from_dlpack(topk_indices),
+        from_dlpack(scatter_t), from_dlpack(ntok_t))
+    gate_args = lambda: (
+        from_dlpack(tile_flags), from_dlpack(flag_idx_t), Int32(n_tiles_target))
+    compiled_gated_ctas = {c: cute.compile(combine_kernel, *base_args(),
+                                           epr, rank, world_size, c, *gate_args())
+                           for c in ctas_list}
+    compiled_ungated = {c: cute.compile(combine_kernel, *base_args(),
+                                        epr, rank, world_size, c)
+                        for c in ctas_list}
+    compiled_gated = compiled_gated_ctas[ctas_list[0]]
+    print(f"[rank {rank}] combine kernels compiled", flush=True)
+
+    def barrier():
+        torch.cuda.synchronize()
+        dist.barrier(device_ids=[rank])
+
+    def check(tag):
+        ok = torch.allclose(combine_out, ref, atol=1e-4, rtol=1e-4)
+        bad = (~torch.isclose(combine_out, ref, atol=1e-4, rtol=1e-4)).sum().item()
+        print(f"[rank {rank}] {tag}: {'OK' if ok else f'FAIL ({bad} elems)'}",
+              flush=True)
+        ok_t = torch.tensor([ok], dtype=torch.int32, device=device)
+        dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
+        return bool(ok_t.item())
+
+    # (A) flags pre-satisfied: warm-up execution + baseline correctness.
+    tile_flags.fill_(n_tiles_target)
+    combine_out.zero_()
+    barrier()
+    compiled_gated(*base_args(), *gate_args())
+    barrier()
+    if not check("gated combine (flags preset)"):
+        raise SystemExit("gated combine preset-flags correctness FAILED")
+
+    # Trickle warm-up (module load) standalone: buffer garbage -> filled.
+    trickle_src = my_data
+    expert_output_buf.fill_(float("nan"))
+    tile_flags.fill_(0)
+    barrier()
+    tstream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled_trickle = cute.compile(
+        _tile_trickle_launch, from_dlpack(trickle_src),
+        from_dlpack(expert_output_buf), from_dlpack(flag_peer_ptrs),
+        Int32(int(rank_tile_base[rank])), Int32(rank_rows[rank]),
+        Int32(n_tiles_target), 64, TILE_M, world_size, tstream)
+    compiled_trickle(
+        from_dlpack(trickle_src), from_dlpack(expert_output_buf),
+        from_dlpack(flag_peer_ptrs), Int32(int(rank_tile_base[rank])),
+        Int32(rank_rows[rank]), Int32(n_tiles_target), tstream)
+    barrier()
+    assert torch.equal(expert_output_buf[:rank_rows[rank]],
+                       my_data[:rank_rows[rank]]), "trickle fill mismatch"
+
+    # (B) the real gating test: garbage buffer, zero flags; combine starts
+    # first and must WAIT for each tile's data-before-flag publish.
+    expert_output_buf.fill_(float("nan"))
+    tile_flags.fill_(0)
+    combine_out.zero_()
+    barrier()
+    combine_stream = torch.cuda.Stream()
+    trickle_stream = torch.cuda.Stream()
+    with torch.cuda.stream(combine_stream):
+        compiled_gated(*base_args(), *gate_args())
+    compiled_trickle(
+        from_dlpack(trickle_src), from_dlpack(expert_output_buf),
+        from_dlpack(flag_peer_ptrs), Int32(int(rank_tile_base[rank])),
+        Int32(rank_rows[rank]), Int32(n_tiles_target),
+        cuda_driver.CUstream(trickle_stream.cuda_stream))
+    barrier()
+    if not check("gated combine (trickled producer)"):
+        raise SystemExit("gated combine trickle correctness FAILED")
+
+    # Benchmark: gated (flags preset) vs ungated, CTA sweep.
+    pull_bytes = num_tokens * topk * hidden * 4
+    tile_flags.fill_(n_tiles_target)
+    barrier()
+    if rank == 0:
+        print(f"\ncombine benchmark ({pull_bytes / 1e6:.0f} MB pulled/rank)")
+        print(f"{'ctas':>6} {'ungated':>10} {'gated':>10} {'overhead':>9}")
+    for c in ctas_list:
+        res = {}
+        for name, fn in (("ungated", lambda: compiled_ungated[c](
+                              *base_args())),
+                         ("gated", lambda: compiled_gated_ctas[c](
+                              *base_args(), *gate_args()))):
+            times = []
+            for it in range(warmup_iterations + iterations):
+                barrier()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                fn()
+                end.record()
+                torch.cuda.synchronize()
+                if it >= warmup_iterations:
+                    times.append(start.elapsed_time(end))
+            t = torch.tensor([float(np.median(times))], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            res[name] = t.item()
+        if rank == 0:
+            print(f"{c:>6} {res['ungated']:>8.3f}ms {res['gated']:>8.3f}ms "
+                  f"{(res['gated'] / res['ungated'] - 1) * 100:>8.1f}%", flush=True)
+
+    nvshmem.core.free_tensor(expert_output_buf)
+    nvshmem.core.free_tensor(tile_flags)
+
+
 def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
                      ctas_list, num_stages, workers,
                      warmup_iterations, iterations):
@@ -2019,6 +2330,18 @@ def main():
                     help="[tma-dispatch] producer/consumer warp pairs per CTA, "
                          "each with a private stage partition and sub-block.")
 
+    # -- TilePipe gated TMA combine (self-contained test + benchmark mode) --
+    tc = parser.add_argument_group("tma-combine")
+    tc.add_argument("--test-tma-combine", action="store_true",
+                    help="Run only the gated CombineTmaKernel correctness test "
+                         "(trickled tile-flag producer) + gated-vs-ungated CTA "
+                         "sweep, then exit.")
+    tc.add_argument("--combine-ctas", default="16,32,64,148",
+                    help="[tma-combine] comma-separated CTA counts to sweep.")
+    tc.add_argument("--combine-n-tiles-target", default=32, type=int,
+                    help="[tma-combine] per-m-tile readiness target "
+                         "(= ceil(N / tile_N) of the producing GEMM).")
+
     parser.add_argument("--save-baseline-to", default=None,
                         help="If set, rank 0 saves output_buf + combine_output_buf "
                              "(plus indices and shape constants) as a .npz file at "
@@ -2026,6 +2349,27 @@ def main():
                              "check_combine pass. A subsequent run can compare "
                              "against this file to verify bit-identity.")
     args = parser.parse_args()
+
+    if args.test_tma_combine:
+        torchrun_uid_init_bcast()
+        try:
+            run_tma_combine(
+                args.num_tokens, args.hidden, args.num_experts, args.topk,
+                ctas_list=[int(x) for x in args.combine_ctas.split(",")],
+                n_tiles_target=args.combine_n_tiles_target,
+                tma_cfg=dict(
+                    hchunk=args.tma_hchunk,
+                    num_stages=args.tma_stages,
+                    tma_threads=args.tma_producer_threads,
+                    consumer_threads=args.tma_consumer_threads,
+                ),
+                warmup_iterations=args.warmup_iterations,
+                iterations=args.iterations)
+        finally:
+            torch.cuda.synchronize()
+            dist.barrier()
+            torchrun_finalize()
+        return
 
     if args.test_tma_dispatch:
         torchrun_uid_init_bcast()
