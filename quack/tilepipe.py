@@ -30,6 +30,8 @@ machines (e.g. for the metadata builders in unit tests).
 """
 
 import os
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -311,6 +313,267 @@ def build_recv_metadata(all_topk, num_experts, rank, world_size):
     return split_sizes.astype(np.int64), cu_seqlens.astype(np.int32), max_recv_tokens
 
 
+def build_combine_metadata(all_topk, num_experts, rank, world_size, tile_m=128):
+    """Consumer/producer metadata for the gated GEMM->combine pair, derived
+    ONCE so the producer's publish space and the consumer's wait space cannot
+    diverge (flag space: per-expert m-tiles, concatenated per producer rank).
+
+    Returns a dict:
+      scatter[t, j]   row of (t, j) in the owner rank's expert-output buffer
+      src_rank[t, j]  owner rank
+      flag_idx[t, j]  flat tile-flag index (producer-rank offset included)
+      tile_lo/tile_hi this rank's per-expert tile row ranges (producer order)
+      tile_offsets    this rank's per-expert exclusive tile-count cumsum
+      rank_tile_base  flag-array offset of each producer rank
+      total_tiles     flag array length
+      cu_seqlens      this rank's expert-output cu_seqlens (int32)
+      rank_rows       expert-output rows per rank
+    """
+    epr = num_experts // world_size
+    counts = np.zeros((world_size, num_experts), dtype=np.int64)
+    for r in range(world_size):
+        counts[r] = np.bincount(all_topk[r].reshape(-1), minlength=num_experts)
+    base = np.zeros((world_size, epr, world_size), dtype=np.int64)
+    for d in range(world_size):
+        c = 0
+        for e in range(epr):
+            for src in range(world_size):
+                base[d, e, src] = c
+                c += counts[src, d * epr + e]
+
+    num_tokens, topk = all_topk[rank].shape
+    topk_flat = all_topk[rank].reshape(-1)
+    dstr = topk_flat // epr
+    el = topk_flat % epr
+    group = dstr * epr + el
+    order = np.argsort(group, kind="stable")
+    sorted_group = group[order]
+    within = np.arange(len(order)) - np.searchsorted(sorted_group, sorted_group, "left")
+    slot = np.empty(len(order), dtype=np.int64)
+    slot[order] = base[dstr[order], el[order], rank] + within
+
+    # Per-producer tile geometry (per-expert tiling, like the GEMM epilogue).
+    cu_by_rank, tile_offsets_by_rank, rank_tiles, rank_rows = [], [], [], []
+    for d in range(world_size):
+        split = counts[:, d * epr : (d + 1) * epr].sum(axis=0)
+        cu = np.concatenate([[0], np.cumsum(split)])
+        mt = (split + tile_m - 1) // tile_m
+        cu_by_rank.append(cu)
+        tile_offsets_by_rank.append(np.concatenate([[0], np.cumsum(mt)])[:-1])
+        rank_tiles.append(int(mt.sum()))
+        rank_rows.append(int(cu[-1]))
+    rank_tile_base = np.concatenate([[0], np.cumsum(rank_tiles)])[:-1]
+
+    exp_of = el  # destination-local expert of each (t, j), token-major flat
+    flag_idx = (
+        rank_tile_base[dstr]
+        + np.array([tile_offsets_by_rank[d][b] for d, b in zip(dstr, exp_of)])
+        + (slot - np.array([cu_by_rank[d][b] for d, b in zip(dstr, exp_of)])) // tile_m
+    )
+
+    my_lo, my_hi = [], []
+    cu = cu_by_rank[rank]
+    for b in range(epr):
+        n_t = int((cu[b + 1] - cu[b] + tile_m - 1) // tile_m)
+        for t in range(n_t):
+            lo = int(cu[b]) + t * tile_m
+            my_lo.append(lo)
+            my_hi.append(min(lo + tile_m, int(cu[b + 1])))
+    assert len(my_lo) == rank_tiles[rank]
+
+    i32 = lambda a: np.ascontiguousarray(a, dtype=np.int32)
+    return dict(
+        scatter=i32(slot.reshape(num_tokens, topk)),
+        src_rank=i32(dstr.reshape(num_tokens, topk)),
+        flag_idx=i32(flag_idx.reshape(num_tokens, topk)),
+        tile_lo=i32(np.array(my_lo)),
+        tile_hi=i32(np.array(my_hi)),
+        tile_offsets=i32(tile_offsets_by_rank[rank]),
+        rank_tile_base=rank_tile_base.astype(np.int64),
+        total_tiles=int(sum(rank_tiles)),
+        cu_seqlens=i32(cu_by_rank[rank]),
+        rank_rows=rank_rows,
+    )
+
+
+def build_push_combine_arrays(all_topk, num_experts, rank, world_size, tile_m=128):
+    """Push-combine send list for `rank`: every row of THIS rank's expert-GEMM
+    output goes back to its token's home rank — the exact reverse of dispatch.
+
+    Rows are walked in producer order (expert-major, then source/home rank,
+    which is the expert-output buffer's own row order), so:
+      * the producer-side gate polls this rank's OWN tile counters and is
+        monotone in tile index — one poll per tile, and it rarely waits;
+      * a segment (= contiguous run of rows with one home rank) maps to one
+        remote arrival publish, exactly like dispatch's segments.
+
+    Destination slot: staging[token * topk + j] on the home rank, so the home
+    rank's reduce is a fixed [tokens, topk, N] -> [tokens, N] contraction.
+
+    Returns (send_row, send_slot, send_dst, send_seg, seg_sizes, gate_idx,
+    arrivals_expected) as int32 numpy arrays; `send_row` indexes this rank's
+    D buffer, `gate_idx` is the row's local tile-flag index.
+    """
+    epr = num_experts // world_size
+    num_tokens, topk = all_topk[rank].shape
+    # Rows of this rank's D buffer, in buffer order: grouped by local expert,
+    # then by source rank, then by that source's token order.
+    rows_home, rows_token, rows_slot_j, rows_expert = [], [], [], []
+    for e in range(epr):
+        ge = rank * epr + e
+        for src in range(world_size):
+            hits = np.argwhere(all_topk[src] == ge)  # (token, j) pairs, sorted
+            for t, j in hits:
+                rows_home.append(src)
+                rows_token.append(int(t))
+                rows_slot_j.append(int(j))
+                rows_expert.append(e)
+    n_rows = len(rows_home)
+    home = np.array(rows_home, dtype=np.int64)
+    tok = np.array(rows_token, dtype=np.int64)
+    jj = np.array(rows_slot_j, dtype=np.int64)
+    exp = np.array(rows_expert, dtype=np.int64)
+    row = np.arange(n_rows, dtype=np.int64)
+
+    # Per-expert m-tiles (the GEMM epilogue's publish space).
+    split = np.bincount(exp, minlength=epr)
+    cu = np.concatenate([[0], np.cumsum(split)])
+    tiles_per_expert = (split + tile_m - 1) // tile_m
+    tile_off = np.concatenate([[0], np.cumsum(tiles_per_expert)])[:-1]
+    gate_idx = tile_off[exp] + (row - cu[exp]) // tile_m
+
+    # Segment = (expert, home rank): contiguous in buffer order by construction.
+    seg = exp * world_size + home
+    seg_sizes = np.bincount(seg, minlength=epr * world_size).astype(np.int32)
+    slot = tok * topk + jj
+
+    # Rows this rank sends to each home rank == that home's arrival target.
+    arrivals_expected = np.bincount(home, minlength=world_size)
+
+    i32 = lambda a: np.ascontiguousarray(a, dtype=np.int32)
+    return (i32(row), i32(slot), i32(home), i32(seg), seg_sizes, i32(gate_idx),
+            arrivals_expected.astype(np.int64))
+
+
+@dataclass
+class CommPlan:
+    """One rank's row list for a varlen all-to-all (VarlenAllToAllKernel).
+
+    Every TilePipe communication phase is the same shape — take local rows,
+    push each to (dst_rank, dst_slot), grouped into segments that publish one
+    counter release each — so dispatch, push-combine and weight transfer are
+    instantiations of this plan, not separate kernels.
+
+      src_row[i]   row of the local source buffer
+      dst_slot[i]  row in the destination rank's buffer
+      dst_rank[i]  destination
+      seg[i]       segment id, ascending (one release per segment)
+      gate_idx[i]  optional: producer counter this row waits on (push-combine)
+      expert[i]    optional: destination-local expert (SIMT dispatch kernel)
+      dst_rows     destination buffer row count (layout extent)
+    """
+
+    src_row: np.ndarray
+    dst_slot: np.ndarray
+    dst_rank: np.ndarray
+    seg: np.ndarray
+    seg_sizes: np.ndarray
+    dst_rows: int
+    gate_idx: Optional[np.ndarray] = None
+    expert: Optional[np.ndarray] = None
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.src_row)
+
+    def to_device(self, device) -> "DeviceCommPlan":
+        dev = lambda a: torch.from_numpy(a).to(device) if a is not None else None
+        return DeviceCommPlan(
+            src_row=dev(self.src_row), dst_slot=dev(self.dst_slot),
+            dst_rank=dev(self.dst_rank), seg=dev(self.seg),
+            seg_sizes=dev(self.seg_sizes), gate_idx=dev(self.gate_idx),
+            expert=dev(self.expert), dst_rows=self.dst_rows, n_rows=self.n_rows,
+            seg_done=torch.zeros(len(self.seg_sizes), dtype=torch.int32,
+                                 device=device))
+
+
+@dataclass
+class DeviceCommPlan:
+    """Device-resident CommPlan + the segment counters, and the ONE place that
+    assembles VarlenAllToAllKernel launch arguments. Kernel args are
+    positional and mix dynamic values with compile-time constants, so building
+    them by hand at each call site is how launch-argument bugs (silent
+    segfaults) happen — always go through args()/compile_args()."""
+
+    src_row: torch.Tensor
+    dst_slot: torch.Tensor
+    dst_rank: torch.Tensor
+    seg: torch.Tensor
+    seg_sizes: torch.Tensor
+    seg_done: torch.Tensor
+    dst_rows: int
+    n_rows: int
+    gate_idx: Optional[torch.Tensor] = None
+    expert: Optional[torch.Tensor] = None
+
+    def reset(self):
+        """Zero the segment counters (stale counters over-publish)."""
+        self.seg_done.zero_()
+
+    def _lists(self, src_buf, dst_peer_ptrs, flag_peer_ptrs):
+        dyn2d = lambda t: from_dlpack(t, assumed_align=32).mark_layout_dynamic(
+            leading_dim=1)
+        dyn1d = lambda t: from_dlpack(t).mark_layout_dynamic(leading_dim=0)
+        return (dyn2d(src_buf), from_dlpack(dst_peer_ptrs),
+                from_dlpack(flag_peer_ptrs), dyn1d(self.src_row),
+                dyn1d(self.dst_slot), dyn1d(self.dst_rank), dyn1d(self.seg),
+                from_dlpack(self.seg_done), from_dlpack(self.seg_sizes),
+                Int32(self.n_rows), Int32(self.dst_rows))
+
+    def _gate(self, gate_flags, gate_target):
+        dyn1d = lambda t: from_dlpack(t).mark_layout_dynamic(leading_dim=0)
+        if gate_flags is None:
+            return ()
+        assert self.gate_idx is not None, "plan has no gate_idx"
+        return (from_dlpack(gate_flags), dyn1d(self.gate_idx), Int32(gate_target))
+
+    def compile_args(self, src_buf, dst_peer_ptrs, flag_peer_ptrs, num_ctas,
+                     rank, world_size, stream, gate_flags=None, gate_target=None):
+        """Args for cute.compile (includes the Constexpr rank/world_size)."""
+        return (*self._lists(src_buf, dst_peer_ptrs, flag_peer_ptrs),
+                Int32(num_ctas), rank, world_size, stream,
+                *self._gate(gate_flags, gate_target))
+
+    def args(self, src_buf, dst_peer_ptrs, flag_peer_ptrs, num_ctas, stream,
+             gate_flags=None, gate_target=None):
+        """Args for a compiled callable (Constexprs are baked in and omitted)."""
+        return (*self._lists(src_buf, dst_peer_ptrs, flag_peer_ptrs),
+                Int32(num_ctas), stream,
+                *self._gate(gate_flags, gate_target))
+
+
+def plan_dispatch(all_topk, num_experts, rank, world_size):
+    """CommPlan for MoE dispatch: local tokens -> peers' expert-grouped recv
+    buffers, expert-major / rank-minor (destination rotated by source rank)."""
+    tok, slot, dst, el, seg, seg_sizes = build_send_arrays(
+        all_topk, num_experts, rank, world_size)
+    _, _, max_recv = build_recv_metadata(all_topk, num_experts, rank, world_size)
+    return CommPlan(src_row=tok, dst_slot=slot, dst_rank=dst, seg=seg,
+                    seg_sizes=seg_sizes, dst_rows=max_recv, expert=el)
+
+
+def plan_combine(all_topk, num_experts, rank, world_size, tile_m=128):
+    """CommPlan for push-combine: local expert-GEMM output rows -> each token's
+    home rank staging[token * topk + j], walked in producer order so the gate
+    on the local GEMM's tile counters is monotone."""
+    num_tokens, topk = all_topk[rank].shape
+    row, slot, home, seg, seg_sizes, gate, _ = build_push_combine_arrays(
+        all_topk, num_experts, rank, world_size, tile_m=tile_m)
+    return CommPlan(src_row=row, dst_slot=slot, dst_rank=home, seg=seg,
+                    seg_sizes=seg_sizes, dst_rows=num_tokens * topk,
+                    gate_idx=gate)
+
+
 def peer_ptr_tensor(symm_tensor, world_size, device):
     """int64[world_size] tensor of each rank's P2P base address for
     `symm_tensor`, indexed by a runtime rank inside kernels via cute.make_ptr."""
@@ -454,9 +717,9 @@ class TilePipe:
         if copy_engine == "tma":
             # The TMA dispatch kernel lives with the other comm kernels in
             # examples/distributed/moe_comm.py (alongside CombineTmaKernel).
-            from moe_comm import DispatchTmaKernel
+            from moe_comm import VarlenAllToAllKernel
 
-            self._tma_kernel = DispatchTmaKernel(
+            self._tma_kernel = VarlenAllToAllKernel(
                 cutlass.BFloat16, hidden, num_stages=tma_stages,
                 workers=tma_workers)
             self._compiled_dispatch = cute.compile(

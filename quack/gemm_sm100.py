@@ -1615,6 +1615,10 @@ class GemmSm100(GemmTmaBase):
             epi_read_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.epi_c_stage
             )
+            # TilePipe deferred tile-flag publish: the tile whose stores are
+            # not yet proven complete (published one work tile behind).
+            prev_flag_idx = Int32(0)
+            prev_tile_valid = Boolean(False)
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
@@ -1693,32 +1697,31 @@ class GemmSm100(GemmTmaBase):
                 acc_consumer_state.advance()
                 tctx.e("epilogue")
 
-                # TilePipe (GEMM->combine): publish this work tile's completion
-                # to every rank's tile-flag array. The D stores are async-proxy
-                # (TMA) writes, so the TMA warp first drains its outstanding
-                # store groups, then fences the proxy boundary, then one lane
-                # bumps flag[offsets[b] + m_tile] on each rank (release/sys).
-                # Consumers treat a row block as ready when the counter hits
-                # the N-tile count.
+                # TilePipe (GEMM->combine): DEFERRED tile-completion publish.
+                # The D stores are async-proxy (TMA) writes tracked in this
+                # thread's bulk groups, so publishing THIS tile would need a
+                # full drain (producer_tail per tile costs ~10% GEMM by
+                # killing the store/mainloop overlap). Instead publish the
+                # PREVIOUS work tile: waiting until pending groups <= this
+                # tile's own group count (epi_tile_num) proves everything
+                # older is complete — a no-op whenever epi_stage <=
+                # epi_tile_num. The last pending tile publishes after the
+                # end-of-loop producer_tail. Counters are order-agnostic, so
+                # the one-tile lag only delays readiness by ~one epilogue.
                 if const_expr(varlen_params.mTileFlagPtrs is not None):
                     if is_tma_warp:
-                        epi_store_pipeline.producer_tail()
+                        cute.arch.cp_async_bulk_wait_group(epi_tile_num)
                         cute.arch.fence_proxy("async")
-                        if cute.arch.lane_idx() == 0:
-                            flag_idx = (
-                                varlen_params.mTileOffsets[batch_idx] + tile_coord_mnkl[0]
-                            )
-                            num_ranks = cute.size(varlen_params.mTileFlagPtrs.shape)
-                            for r in cutlass.range(num_ranks):
-                                flag_ptr = cute.make_ptr(
-                                    Int32,
-                                    varlen_params.mTileFlagPtrs[r],
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=4,
+                        if prev_tile_valid:
+                            if cute.arch.lane_idx() == 0:
+                                sem = ExpertArrivalSemaphore(
+                                    peer_ptrs=varlen_params.mTileFlagPtrs
                                 )
-                                cute.arch.atomic_add(
-                                    flag_ptr + flag_idx, Int32(1), sem="release", scope="sys"
-                                )
+                                sem.arrive_all(prev_flag_idx, Int32(1))
+                        prev_flag_idx = (
+                            varlen_params.mTileOffsets[batch_idx] + tile_coord_mnkl[0]
+                        )
+                        prev_tile_valid = Boolean(True)
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1727,6 +1730,16 @@ class GemmSm100(GemmTmaBase):
             # Wait for D store complete
             if is_tma_warp:
                 epi_store_pipeline.producer_tail()
+            # TilePipe: the last deferred tile is provably complete now.
+            if const_expr(varlen_params.mTileFlagPtrs is not None):
+                if is_tma_warp:
+                    cute.arch.fence_proxy("async")
+                    if prev_tile_valid:
+                        if cute.arch.lane_idx() == 0:
+                            sem = ExpertArrivalSemaphore(
+                                peer_ptrs=varlen_params.mTileFlagPtrs
+                            )
+                            sem.arrive_all(prev_flag_idx, Int32(1))
 
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
