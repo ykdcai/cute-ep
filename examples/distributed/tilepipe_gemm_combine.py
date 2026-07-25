@@ -16,7 +16,9 @@ Run (2 GPUs):
 """
 
 import argparse
+import datetime
 import functools
+import json
 import os
 
 import numpy as np
@@ -37,7 +39,8 @@ from moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
                       CombineTmaKernel, VarlenAllToAllKernel)
 
 from quack.gemm import gemm as quack_gemm
-from quack.tilepipe import build_combine_metadata, plan_combine, peer_ptr_tensor
+from quack.tilepipe import (build_combine_metadata, plan_combine,
+                            peer_ptr_tensor, dyn)
 from quack.tilepipe_sync import wait_flag
 
 # Stage prints are hang diagnostics — they must not sit in a stdio buffer.
@@ -143,13 +146,16 @@ def run(args):
     combine_kernel = CombineTmaKernel(
         cutlass.BFloat16, n, args.topk, hchunk=args.hchunk,
         num_stages=args.combine_stages)
-    peer_tensors = [from_dlpack(nvshmem.core.get_peer_tensor(d_buf, r))
+    # All token-dependent extents are dynamic so ONE compile serves every
+    # token count (production: the count changes every step).
+    peer_tensors = [dyn(nvshmem.core.get_peer_tensor(d_buf, r), leading_dim=1)
                     for r in range(world_size)]
     base_args = lambda: (
-        peer_tensors, from_dlpack(combine_out), from_dlpack(topk_indices),
-        from_dlpack(scatter_t), from_dlpack(ntok_t))
+        peer_tensors, dyn(combine_out, leading_dim=1),
+        dyn(topk_indices, leading_dim=1), dyn(scatter_t, leading_dim=1),
+        from_dlpack(ntok_t))
     gate_args = lambda: (
-        from_dlpack(tile_flags), from_dlpack(flag_idx_t), Int32(n_tiles))
+        dyn(tile_flags), dyn(flag_idx_t, leading_dim=1), Int32(n_tiles))
 
     # --- Push-combine (reverse dispatch): this rank PUSHES each of its D rows
     # back to the token's home rank as soon as the row's tile is produced, and
@@ -194,10 +200,10 @@ def run(args):
     # passed explicitly (a default-stream combine under comm_stream events
     # silently measured nothing).
     combine_gated = {c: cute.compile(combine_kernel, *base_args(), epr, rank,
-                                     world_size, c, *gate_args(), cur())
+                                     world_size, c, cur(), *gate_args())
                      for c in args.combine_ctas_list}
     combine_ungated = {c: cute.compile(combine_kernel, *base_args(), epr, rank,
-                                       world_size, c, None, None, None, cur())
+                                       world_size, c, cur())
                        for c in args.combine_ctas_list}
     push_compiled = {c: cute.compile(push_kernel, *dplan.compile_args(
         d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, rank, world_size, cur(),
@@ -296,7 +302,7 @@ def run(args):
 
     # Combine warm-up + serial correctness (flags already satisfied).
     c0 = args.combine_ctas_list[0]
-    combine_gated[c0](*base_args(), *gate_args(), cur())
+    combine_gated[c0](*base_args(), cur(), *gate_args())
     barrier()
     if not check("serial GEMM->combine"):
         raise SystemExit("serial correctness FAILED")
@@ -306,7 +312,7 @@ def run(args):
     # --- Overlapped correctness: combine first (high-priority comm stream,
     # it spins on flags), then the capped publishing GEMM ---
     def overlapped(c_ctas):
-        combine_gated[c_ctas](*base_args(), *gate_args(), cs(comm_stream))
+        combine_gated[c_ctas](*base_args(), cs(comm_stream), *gate_args())
         launch_gemm(publish=True, max_clusters=num_sms - c_ctas,
                     stream=gemm_stream)
 
@@ -342,8 +348,15 @@ def run(args):
     if not check("overlapped GEMM->push-combine"):
         raise SystemExit("push-combine overlapped correctness FAILED")
 
+    def free_symmetric():
+        nvshmem.core.free_tensor(d_buf)
+        nvshmem.core.free_tensor(tile_flags)
+        nvshmem.core.free_tensor(staging)
+        nvshmem.core.free_tensor(arrivals)
+
     if not args.benchmark:
-        return
+        free_symmetric()
+        return None
 
     # --- Benchmark ---
     def time_iters(enqueue, pre_reset):
@@ -384,7 +397,7 @@ def run(args):
 
     def serial(c):
         launch_gemm(publish=True, stream=comm_stream)
-        combine_gated[c](*base_args(), *gate_args(), cs(comm_stream))
+        combine_gated[c](*base_args(), cs(comm_stream), *gate_args())
 
     # Fair serial baseline: each phase gets the whole GPU, so the combine
     # runs with the LARGEST CTA count in the sweep (a small-CTA serial
@@ -422,15 +435,83 @@ def run(args):
                   f"{t_serial / t_push_over[c]:>7.2f}x "
                   f"{t_push_serial / t_push_over[c]:>11.2f}x")
 
-    nvshmem.core.free_tensor(d_buf)
-    nvshmem.core.free_tensor(tile_flags)
-    nvshmem.core.free_tensor(staging)
-    nvshmem.core.free_tensor(arrivals)
+    free_symmetric()
+    return dict(
+        tokens=args.tokens, total_m=total_m, K=k, N=n, topk=args.topk,
+        experts=args.experts, world=world_size, num_sms=num_sms,
+        gemm_ms=t_gemm_plain, gemm_publish_ms=t_gemm_pub,
+        gemm_tflops=2 * total_m * n * k / t_gemm_plain / 1e9,
+        publish_overhead_pct=(t_gemm_pub / t_gemm_plain - 1) * 100,
+        serial_pull_ms=t_serial, serial_push_ms=t_push_serial,
+        serial_ctas=c_serial,
+        combine_ms={c: t_comb[c] for c in args.combine_ctas_list},
+        pull_overlapped_ms={c: t_over[c] for c in args.combine_ctas_list},
+        push_overlapped_ms={c: t_push_over[c] for c in args.combine_ctas_list},
+    )
+
+
+def write_results(results, args, world_size):
+    """Rank 0 writes the sweep to a timestamped run directory: results.json
+    (machine-readable) + results.md (the tables as printed)."""
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = (f"gemm_combine_{world_size}gpu_N{args.n}_K{args.hidden}_"
+            f"topk{args.topk}_{stamp}")
+    outdir = os.path.join(args.results_dir, name)
+    os.makedirs(outdir, exist_ok=True)
+
+    with open(os.path.join(outdir, "results.json"), "w") as f:
+        json.dump({"config": vars(args) | {"world_size": world_size},
+                   "runs": [{k: (v if not isinstance(v, dict)
+                                 else {str(kk): vv for kk, vv in v.items()})
+                             for k, v in r.items()} for r in results]},
+                  f, indent=2, default=str)
+
+    lines = [f"# TilePipe GEMM -> combine ({world_size} GPUs)", "",
+             f"- generated: {stamp}",
+             f"- K={args.hidden} N={args.n} topk={args.topk} "
+             f"experts={args.experts} tile={args.tile_m}x{args.tile_n}",
+             f"- combine CTAs swept: {args.combine_ctas_list}", ""]
+    lines += ["## Summary (best overlapped vs serial)", "",
+              "| tokens/rank | GEMM ms | +publish | pure combine (best) | "
+              "serial pull | serial push | best pull-ovl | best push-ovl | "
+              "best push vs push-ser |", "|---|---|---|---|---|---|---|---|---|"]
+    for r in results:
+        bc = min(r["combine_ms"].values())
+        bp = min(r["pull_overlapped_ms"].values())
+        bs = min(r["push_overlapped_ms"].values())
+        lines.append(
+            f"| {r['tokens']} | {r['gemm_ms']:.3f} | "
+            f"{r['publish_overhead_pct']:+.1f}% | {bc:.3f} | "
+            f"{r['serial_pull_ms']:.3f} | {r['serial_push_ms']:.3f} | "
+            f"{bp:.3f} | {bs:.3f} | {r['serial_push_ms'] / bs:.2f}x |")
+    for r in results:
+        lines += ["", f"## tokens/rank = {r['tokens']} (total_m={r['total_m']})", "",
+                  f"pure GEMM {r['gemm_ms']:.3f} ms ({r['gemm_tflops']:.0f} TFLOPS); "
+                  f"with publish {r['gemm_publish_ms']:.3f} ms "
+                  f"({r['publish_overhead_pct']:+.1f}%)",
+                  f"serial pull @{r['serial_ctas']} CTAs {r['serial_pull_ms']:.3f} ms; "
+                  f"serial push {r['serial_push_ms']:.3f} ms", "",
+                  "| CTAs | pure combine | pull-ovl | vs pull-ser | push-ovl | "
+                  "vs push-ser |", "|---|---|---|---|---|---|"]
+        for c in sorted(r["combine_ms"]):
+            lines.append(
+                f"| {c} | {r['combine_ms'][c]:.3f} | {r['pull_overlapped_ms'][c]:.3f} "
+                f"| {r['serial_pull_ms'] / r['pull_overlapped_ms'][c]:.2f}x "
+                f"| {r['push_overlapped_ms'][c]:.3f} "
+                f"| {r['serial_push_ms'] / r['push_overlapped_ms'][c]:.2f}x |")
+    with open(os.path.join(outdir, "results.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\nresults written to {outdir}/ (results.json, results.md)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="TilePipe GEMM -> gated combine")
-    parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument("--tokens", type=int, default=None,
+                        help="single token count (overrides --token-sweep)")
+    parser.add_argument("--token-sweep", type=str, default="2048,4096,8192,16384",
+                        help="comma-separated tokens/rank to sweep")
+    parser.add_argument("--results-dir", type=str, default="bench_results",
+                        help="parent dir for the timestamped run directory")
     parser.add_argument("--hidden", type=int, default=7168, help="GEMM K")
     parser.add_argument("--gemm-n", dest="n", type=int, default=4096)
     parser.add_argument("--experts", type=int, default=None,
@@ -451,6 +532,9 @@ def main():
     parser.add_argument("--no-benchmark", dest="benchmark", action="store_false")
     args = parser.parse_args()
     args.combine_ctas_list = [int(x) for x in args.combine_ctas.split(",")]
+    token_list = ([args.tokens] if args.tokens is not None
+                  else [int(x) for x in args.token_sweep.split(",")])
+    args.tokens = max(token_list)  # heap must cover the largest run
 
     if "NVSHMEM_SYMMETRIC_SIZE" not in os.environ:
         # d_buf (~1.5x expected rows) + staging (tokens*topk exactly) + flags
@@ -469,7 +553,18 @@ def main():
           f"device=cuda:{torch.cuda.current_device()} "
           f"({torch.cuda.get_device_name()})")
     try:
-        run(args)
+        results = []
+        for tok in token_list:
+            args.tokens = tok
+            if rank == 0:
+                print(f"\n{'=' * 70}\n=== tokens/rank = {tok} ===\n{'=' * 70}")
+            r = run(args)
+            if r is not None:
+                results.append(r)
+            torch.cuda.synchronize()
+            dist.barrier()
+        if rank == 0 and results:
+            write_results(results, args, dist.get_world_size())
     finally:
         torch.cuda.synchronize()
         dist.barrier()

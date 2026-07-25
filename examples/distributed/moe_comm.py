@@ -26,7 +26,10 @@ To run:
 """
 
 import os
+import sys
+import json
 import argparse
+import datetime
 from typing import Optional
 import functools
 
@@ -42,6 +45,7 @@ from cutlass.cutlass_dsl import Int32
 import cuda.bindings.driver as cuda_driver
 from cuda.core import Device
 
+from quack.tilepipe import dyn
 from quack.tilepipe_sync import ExpertArrivalSemaphore, flag_trickle
 
 import nvshmem.core
@@ -486,6 +490,24 @@ def _per_thread_view(tile_1d, vec_size, consumer_threads, ctid):
     return cute.slice_(by_vec, ((None, ctid), None))
 
 
+# TODO(correctness): nondeterministic wrong rows at larger token counts.
+# Repro (single GPU, fp32, hidden=4096, hchunk=2048, topk=4, cta_nums=8,
+# NUM_STAGES=8): compile+run at tokens=256/512/1024 against a
+# `peer.view(tokens, topk, n).sum(dim=1)` reference with scatter = arange:
+#   tokens=256 -> 0 bad rows, 512 -> 0, 1024 -> 1..2 bad rows, varying per
+#   trial (rows differ far beyond fp32 rounding, so it is corruption, not
+#   accumulation order).
+# NOT a dynamic-shape artifact: it reproduces identically with statically
+# compiled shapes, so it predates the mark_layout_dynamic change. It also
+# likely explains why the pull-combine path reports rel_err ~8e-3 in
+# examples/distributed/tilepipe_gemm_combine.py while the push-combine path
+# reports ~3e-3 on the same data.
+# First suspect: the consumer releases stages with a raw
+# `tma_pipeline.sync_object_empty.arrive(cons.index, consumer_mask)` instead
+# of `consumer_release(state)`, with CONSUMER_THREADS=128 arriving; check that
+# every consumer thread has finished reading the stage (barrier / full mask)
+# before the producer may refill it, and that the arrive count matches the
+# cooperative group size.
 class CombineTmaKernel:
     # All knobs are constructor args (below) so the kernel is autotunable.
     # Defaults chosen for hidden=7168 fp32 on B200.
@@ -532,6 +554,11 @@ class CombineTmaKernel:
         local_rank: cutlass.Constexpr,
         world_size: cutlass.Constexpr,
         cta_nums: cutlass.Constexpr,
+        # Launch stream: REQUIRED. cute launches ignore torch.cuda.stream()
+        # contexts, so an implicit default-stream launch silently runs outside
+        # the caller's stream (and outside its timing events). Never make this
+        # optional.
+        stream: cuda_driver.CUstream,
         # TilePipe GEMM->combine gate (all-or-none): local mirror of every
         # producer's tile-completion counters, the host-precomputed flat flag
         # index per (token, j) (producer-rank offset included), and the
@@ -539,9 +566,6 @@ class CombineTmaKernel:
         tile_flags: Optional[cute.Tensor] = None,
         flag_idx: Optional[cute.Tensor] = None,
         n_tiles: Optional[Int32] = None,
-        # Launch stream. NOTE: without this the kernel lands on the DEFAULT
-        # stream — torch.cuda.stream() contexts do NOT affect cute launches.
-        stream: Optional[cuda_driver.CUstream] = None,
     ):
         # Raw 1D cp.async.bulk: each peer buffer is just flattened to 1D; the
         # producer slices a contiguous HCHUNK run by tile id. No TMA descriptor.
@@ -554,25 +578,17 @@ class CombineTmaKernel:
         out_total = cute.size(output_tensor.layout)
         out_flat = cute.make_tensor(output_tensor.iterator, cute.make_layout((out_total,)))
 
-        kern = self.kernel(
+        self.kernel(
             peer_flat, out_flat,
             topk_indices, scatter_idx, num_input_tokens,
             experts_per_rank, local_rank, world_size, cta_nums,
             tile_flags, flag_idx, n_tiles,
+        ).launch(
+            grid=[cta_nums, 1, 1],
+            block=[self.threads_per_cta, 1, 1],
+            smem=self._SharedStorage.size_in_bytes(),
+            stream=stream,
         )
-        if cutlass.const_expr(stream is not None):
-            kern.launch(
-                grid=[cta_nums, 1, 1],
-                block=[self.threads_per_cta, 1, 1],
-                smem=self._SharedStorage.size_in_bytes(),
-                stream=stream,
-            )
-        else:
-            kern.launch(
-                grid=[cta_nums, 1, 1],
-                block=[self.threads_per_cta, 1, 1],
-                smem=self._SharedStorage.size_in_bytes(),
-            )
 
     @cute.kernel
     def kernel(
@@ -1435,15 +1451,17 @@ def run_moe_dispatch_combine(num_tokens, hidden, num_experts, topk,
         # TMA path takes peer output tensors directly (descriptors built
         # host-side from each peer's buffer); config is baked as constexpr.
         peer_output_tensors = [
-            from_dlpack(nvshmem.core.get_peer_tensor(output_buf, r))
+            dyn(nvshmem.core.get_peer_tensor(output_buf, r), leading_dim=1)
             for r in range(world_size)]
         tma_kernel = CombineTmaKernel(cutlass.Float32, hidden, topk, **combine_tma_cfg)
+        cur_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
         combine_run_args = (
             peer_output_tensors, combine_cute,
             topk_idx_cute, scatter_cute, ntok_cute)
         compiled_combine = cute.compile(
             tma_kernel, *combine_run_args,
-            experts_per_rank, rank, world_size, combine_cta_nums)
+            experts_per_rank, rank, world_size, combine_cta_nums, cur_stream)
+        combine_run_args = (*combine_run_args, cur_stream)
     else:
         combine_run_args = (
             expert_output_peer_cute, combine_cute,
@@ -1757,6 +1775,7 @@ def autotune_combine_tma(*, peer_output_tensors, combine_cute, combine_output_bu
     a fast-but-wrong config can never win.
     """
     bytes_moved = num_tokens * topk * hidden * 4  # float32, one topk-sum pass
+    auto_stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     args = (peer_output_tensors, combine_cute, topk_idx_cute, scatter_cute, ntok_cute)
 
     def bench_one(cfg, cta):
@@ -1766,7 +1785,7 @@ def autotune_combine_tma(*, peer_output_tensors, combine_cute, combine_output_bu
         try:
             kernel = CombineTmaKernel(cutlass.Float32, hidden, topk, **cfg)
             compiled = cute.compile(
-                kernel, *args, experts_per_rank, rank, world_size, cta)
+                kernel, *args, experts_per_rank, rank, world_size, cta, auto_stream)
         except Exception as exc:  # noqa: BLE001 - report and skip bad configs
             if rank == 0:
                 print(f"    [skip] cfg={cfg} cta={cta}: compile failed ({exc})")
@@ -1775,7 +1794,7 @@ def autotune_combine_tma(*, peer_output_tensors, combine_cute, combine_output_bu
         combine_output_buf.zero_()
         torch.cuda.synchronize()
         dist.barrier()
-        compiled(*args)
+        compiled(*args, auto_stream)
         torch.cuda.synchronize()
         nstream = Device().create_stream()
         nvshmem.core.barrier(nvshmem.core.Teams.TEAM_WORLD, stream=nstream)
@@ -1984,21 +2003,22 @@ def run_tma_combine(num_tokens, hidden, num_experts, topk,
         ref += (data_d[idx] * mask.unsqueeze(-1)).sum(dim=1)
         del data_d
 
-    peer_tensors = [from_dlpack(nvshmem.core.get_peer_tensor(expert_output_buf, r))
-                    for r in range(world_size)]
+    peer_tensors = [dyn(nvshmem.core.get_peer_tensor(expert_output_buf, r),
+                        leading_dim=1) for r in range(world_size)]
     combine_kernel = CombineTmaKernel(cutlass.Float32, hidden, topk, **tma_cfg)
     base_args = lambda: (
-        peer_tensors, from_dlpack(combine_out), from_dlpack(topk_indices),
-        from_dlpack(scatter_t), from_dlpack(ntok_t))
+        peer_tensors, dyn(combine_out, leading_dim=1),
+        dyn(topk_indices, leading_dim=1), dyn(scatter_t, leading_dim=1),
+        from_dlpack(ntok_t))
     gate_args = lambda: (
-        from_dlpack(tile_flags), from_dlpack(flag_idx_t), Int32(n_tiles_target))
+        dyn(tile_flags), dyn(flag_idx_t, leading_dim=1), Int32(n_tiles_target))
     cur_cs = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled_gated_ctas = {c: cute.compile(combine_kernel, *base_args(),
-                                           epr, rank, world_size, c, *gate_args(),
-                                           cur_cs)
+                                           epr, rank, world_size, c, cur_cs,
+                                           *gate_args())
                            for c in ctas_list}
     compiled_ungated = {c: cute.compile(combine_kernel, *base_args(),
-                                        epr, rank, world_size, c)
+                                        epr, rank, world_size, c, cur_cs)
                         for c in ctas_list}
     compiled_gated = compiled_gated_ctas[ctas_list[0]]
     print(f"[rank {rank}] combine kernels compiled", flush=True)
@@ -2020,7 +2040,7 @@ def run_tma_combine(num_tokens, hidden, num_experts, topk,
     tile_flags.fill_(n_tiles_target)
     combine_out.zero_()
     barrier()
-    compiled_gated(*base_args(), *gate_args(), cur_cs)
+    compiled_gated(*base_args(), cur_cs, *gate_args())
     barrier()
     if not check("gated combine (flags preset)"):
         raise SystemExit("gated combine preset-flags correctness FAILED")
@@ -2065,8 +2085,8 @@ def run_tma_combine(num_tokens, hidden, num_experts, topk,
     barrier()
     combine_stream = torch.cuda.Stream(priority=-1)
     trickle_stream = torch.cuda.Stream()
-    compiled_gated(*base_args(), *gate_args(),
-                   cuda_driver.CUstream(combine_stream.cuda_stream))
+    compiled_gated(*base_args(),
+                   cuda_driver.CUstream(combine_stream.cuda_stream), *gate_args())
     compiled_trickle(
         *trickle_args(cuda_driver.CUstream(trickle_stream.cuda_stream)))
     barrier()
@@ -2083,9 +2103,9 @@ def run_tma_combine(num_tokens, hidden, num_experts, topk,
     for c in ctas_list:
         res = {}
         for name, fn in (("ungated", lambda: compiled_ungated[c](
-                              *base_args())),
+                              *base_args(), cur_cs)),
                          ("gated", lambda: compiled_gated_ctas[c](
-                              *base_args(), *gate_args(), cur_cs))):
+                              *base_args(), cur_cs, *gate_args()))):
             times = []
             for it in range(warmup_iterations + iterations):
                 barrier()
@@ -2106,6 +2126,33 @@ def run_tma_combine(num_tokens, hidden, num_experts, topk,
 
     nvshmem.core.free_tensor(expert_output_buf)
     nvshmem.core.free_tensor(tile_flags)
+
+
+def write_kernel_results(tag, rows, meta, results_dir="bench_results"):
+    """Rank 0 writes a kernel-level sweep to a timestamped run directory:
+    results.json + results.md. `rows` is a list of dicts with at least
+    tokens/ctas/time_ms/gbps."""
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = (f"{tag}_{meta['world']}gpu_h{meta['hidden']}_topk{meta['topk']}_"
+            f"e{meta['experts']}_{stamp}")
+    outdir = os.path.join(results_dir, name)
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "results.json"), "w") as f:
+        json.dump({"config": meta, "rows": rows}, f, indent=2, default=str)
+    lines = [f"# {tag} kernel benchmark ({meta['world']} GPUs)", "",
+             f"- generated: {stamp}",
+             f"- hidden/N={meta['hidden']} topk={meta['topk']} "
+             f"experts={meta['experts']} stages={meta['stages']} "
+             f"workers={meta['workers']}", "",
+             "| tokens/rank | CTAs | MB moved | time ms | GB/s | GB/s per SM |",
+             "|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['tokens']} | {r['ctas']} | {r['mb']:.0f} | "
+                     f"{r['time_ms']:.3f} | {r['gbps']:.0f} | "
+                     f"{r['gbps'] / r['ctas']:.1f} |")
+    with open(os.path.join(outdir, "results.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\nresults written to {outdir}/ (results.json, results.md)")
 
 
 def run_push_combine(num_tokens, hidden, num_experts, topk,
@@ -2217,6 +2264,7 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
     del ref
 
     push_bytes = n_rows * hidden * 2
+    rows_out = []
     if rank == 0:
         print(f"\npush-combine benchmark ({push_bytes / 1e6:.0f} MB pushed/rank)")
         print(f"{'ctas':>6} {'time':>10} {'GB/s':>8} {'GB/s/SM':>9}")
@@ -2240,10 +2288,13 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
         if rank == 0:
             gbps = push_bytes / t_ms / 1e6
             print(f"{c:>6} {t_ms:>8.3f}ms {gbps:>8.0f} {gbps / c:>9.1f}", flush=True)
+            rows_out.append(dict(tokens=num_tokens, ctas=c,
+                                 mb=push_bytes / 1e6, time_ms=t_ms, gbps=gbps))
 
     nvshmem.core.free_tensor(d_buf)
     nvshmem.core.free_tensor(staging)
     nvshmem.core.free_tensor(arrivals)
+    return rows_out
 
 
 def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
@@ -2337,6 +2388,7 @@ def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
 
     # Benchmark: CTA sweep, median over iterations, slowest rank counts.
     send_bytes = total_sends * hidden * 2
+    rows_out = []
     if rank == 0:
         print(f"\nTMA dispatch benchmark ({send_bytes / 1e6:.0f} MB pushed/rank)")
         print(f"{'ctas':>6} {'time':>10} {'GB/s':>8} {'GB/s/SM':>9}")
@@ -2359,10 +2411,13 @@ def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
             gbps = send_bytes / t_ms / 1e6
             print(f"{ctas:>6} {t_ms:>8.3f}ms {gbps:>8.0f} {gbps / ctas:>9.1f}",
                   flush=True)
+            rows_out.append(dict(tokens=num_tokens, ctas=ctas,
+                                 mb=send_bytes / 1e6, time_ms=t_ms, gbps=gbps))
 
     nvshmem.core.free_tensor(input_buf)
     nvshmem.core.free_tensor(recv_buf)
     nvshmem.core.free_tensor(flags)
+    return rows_out
 
 
 def run(num_tokens, hidden, num_experts, topk, benchmark=False,
@@ -2454,6 +2509,11 @@ def main():
     td.add_argument("--dispatch-tma-stages", default=12, type=int,
                     help="[tma-dispatch] SMEM stage budget (14 KB each at "
                          "hidden=7168).")
+    td.add_argument("--token-sweep", default="2048,4096,8192,16384",
+                    help="[tma-dispatch/push-combine] comma-separated "
+                         "tokens/rank to sweep (--num_tokens overrides).")
+    td.add_argument("--results-dir", default="bench_results",
+                    help="parent dir for the timestamped results directory.")
     td.add_argument("--test-push-combine", action="store_true",
                     help="Run only the push-combine (reverse dispatch) "
                          "correctness test + CTA sweep, then exit. Uses "
@@ -2503,32 +2563,38 @@ def main():
             torchrun_finalize()
         return
 
-    if args.test_push_combine:
+    if args.test_push_combine or args.test_tma_dispatch:
+        # --num_tokens (explicitly set) pins a single size; otherwise sweep.
+        explicit = any(a.startswith("--num_tokens") for a in sys.argv)
+        token_list = ([args.num_tokens] if explicit
+                      else [int(x) for x in args.token_sweep.split(",")])
+        fn = run_push_combine if args.test_push_combine else run_tma_dispatch
+        tag = "push_combine" if args.test_push_combine else "tma_dispatch"
         torchrun_uid_init_bcast()
         try:
-            run_push_combine(
-                args.num_tokens, args.hidden, args.num_experts, args.topk,
-                ctas_list=[int(x) for x in args.dispatch_ctas.split(",")],
-                num_stages=args.dispatch_tma_stages,
-                workers=args.dispatch_tma_workers,
-                warmup_iterations=args.warmup_iterations,
-                iterations=args.iterations)
-        finally:
-            torch.cuda.synchronize()
-            dist.barrier()
-            torchrun_finalize()
-        return
-
-    if args.test_tma_dispatch:
-        torchrun_uid_init_bcast()
-        try:
-            run_tma_dispatch(
-                args.num_tokens, args.hidden, args.num_experts, args.topk,
-                ctas_list=[int(x) for x in args.dispatch_ctas.split(",")],
-                num_stages=args.dispatch_tma_stages,
-                workers=args.dispatch_tma_workers,
-                warmup_iterations=args.warmup_iterations,
-                iterations=args.iterations)
+            rank = dist.get_rank()
+            rows = []
+            for tok in token_list:
+                if rank == 0:
+                    print(f"\n{'=' * 70}\n=== tokens/rank = {tok} ==="
+                          f"\n{'=' * 70}", flush=True)
+                r = fn(tok, args.hidden, args.num_experts, args.topk,
+                       ctas_list=[int(x) for x in args.dispatch_ctas.split(",")],
+                       num_stages=args.dispatch_tma_stages,
+                       workers=args.dispatch_tma_workers,
+                       warmup_iterations=args.warmup_iterations,
+                       iterations=args.iterations)
+                if r:
+                    rows.extend(r)
+                torch.cuda.synchronize()
+                dist.barrier()
+            if rank == 0 and rows:
+                write_kernel_results(tag, rows, dict(
+                    world=dist.get_world_size(), hidden=args.hidden,
+                    topk=args.topk, experts=args.num_experts,
+                    stages=args.dispatch_tma_stages,
+                    workers=args.dispatch_tma_workers,
+                    tokens=token_list), results_dir=args.results_dir)
         finally:
             torch.cuda.synchronize()
             dist.barrier()

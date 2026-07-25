@@ -521,21 +521,17 @@ class DeviceCommPlan:
         self.seg_done.zero_()
 
     def _lists(self, src_buf, dst_peer_ptrs, flag_peer_ptrs):
-        dyn2d = lambda t: from_dlpack(t, assumed_align=32).mark_layout_dynamic(
-            leading_dim=1)
-        dyn1d = lambda t: from_dlpack(t).mark_layout_dynamic(leading_dim=0)
-        return (dyn2d(src_buf), from_dlpack(dst_peer_ptrs),
-                from_dlpack(flag_peer_ptrs), dyn1d(self.src_row),
-                dyn1d(self.dst_slot), dyn1d(self.dst_rank), dyn1d(self.seg),
-                from_dlpack(self.seg_done), from_dlpack(self.seg_sizes),
+        return (dyn(src_buf, leading_dim=1, assumed_align=32),
+                from_dlpack(dst_peer_ptrs), from_dlpack(flag_peer_ptrs),
+                dyn(self.src_row), dyn(self.dst_slot), dyn(self.dst_rank),
+                dyn(self.seg), dyn(self.seg_done), dyn(self.seg_sizes),
                 Int32(self.n_rows), Int32(self.dst_rows))
 
     def _gate(self, gate_flags, gate_target):
-        dyn1d = lambda t: from_dlpack(t).mark_layout_dynamic(leading_dim=0)
         if gate_flags is None:
             return ()
         assert self.gate_idx is not None, "plan has no gate_idx"
-        return (from_dlpack(gate_flags), dyn1d(self.gate_idx), Int32(gate_target))
+        return (dyn(gate_flags), dyn(self.gate_idx), Int32(gate_target))
 
     def compile_args(self, src_buf, dst_peer_ptrs, flag_peer_ptrs, num_ctas,
                      rank, world_size, stream, gate_flags=None, gate_target=None):
@@ -550,6 +546,16 @@ class DeviceCommPlan:
         return (*self._lists(src_buf, dst_peer_ptrs, flag_peer_ptrs),
                 Int32(num_ctas), stream,
                 *self._gate(gate_flags, gate_target))
+
+
+def dyn(t, leading_dim=0, assumed_align=None):
+    """from_dlpack with a DYNAMIC layout: the non-leading extent (e.g. the
+    token/row count) becomes a runtime value, so a compiled kernel serves any
+    token count. Static shapes would re-specialize per size — unusable in
+    serving, where the token count changes every step (chunked prefill, varying
+    decode batch). Only pass compile-time-stable dims as `leading_dim`."""
+    kw = {} if assumed_align is None else {"assumed_align": assumed_align}
+    return from_dlpack(t, **kw).mark_layout_dynamic(leading_dim=leading_dim)
 
 
 def plan_dispatch(all_topk, num_experts, rank, world_size):
