@@ -29,8 +29,41 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
+from cutlass._mlir.dialects import llvm
+from cutlass._mlir.extras import types as T
+from cutlass.cutlass_dsl import dsl_user_op
 
 from quack.cute_dsl_utils import nanosleep
+
+
+@dsl_user_op
+def ld_acquire_sys(ptr, *, loc=None, ip=None) -> Int32:
+    """`ld.acquire.sys.global.b32` — an acquire LOAD of a 32-bit flag.
+
+    Polling with `atomic_add(ptr, 0, acquire, sys)` gives the same ordering but
+    is a read-modify-write: it takes the line exclusively at L2 every
+    iteration, which both costs the waiter latency on its critical path and
+    invalidates the *publisher's* copy of the line it is waiting on. A load
+    leaves the line shared.
+
+    `has_side_effects=True` is load-bearing: without it the compiler treats the
+    load as pure, hoists it out of the spin loop, and the wait never
+    terminates. The "gate blocks until producer publishes" functional tests are
+    the regression gate for exactly that.
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dataclass
@@ -47,15 +80,14 @@ class ExpertArrivalSemaphore:
 
     @cute.jit
     def poll(self, e: Int32, target: Int32):
-        """Single-thread: acquire-poll flag[e] until it reaches target."""
-        arrived = cute.arch.atomic_add(
-            self.flags.iterator + e, Int32(0), sem="acquire", scope="sys"
-        )
+        """Single-thread: acquire-poll flag[e] until it reaches target.
+
+        Uses an acquire LOAD, not an atomic RMW — see ld_acquire_sys."""
+        ptr = self.flags.iterator + e
+        arrived = ld_acquire_sys(ptr)
         while arrived < target:
             nanosleep(256)
-            arrived = cute.arch.atomic_add(
-                self.flags.iterator + e, Int32(0), sem="acquire", scope="sys"
-            )
+            arrived = ld_acquire_sys(ptr)
 
     @cute.jit
     def wait_warp(self, e: Int32, target: Int32):
@@ -173,3 +205,105 @@ def wait_flag(flags: cute.Tensor, idx: Int32, target: Int32, stream: cuda.CUstre
     host synchronization."""
     _wait_flag_kernel(flags, idx, target).launch(
         grid=[1, 1, 1], block=[32, 1, 1], stream=stream)
+
+
+# ---------------------------------------------------------------------------
+# LayoutSemaphore: readiness for GEMM-produced tiles.
+# ---------------------------------------------------------------------------
+# Scope: consumers of a GEMM's output tiles (GEMM->combine, GEMM->allreduce).
+# Dispatch keeps ExpertArrivalSemaphore — its producer unit is a token, not a
+# tile, and its target is ragged (split_sizes).
+#
+# The producer publishes at its NATURAL coordinate — the epilogue's
+# (batch, m_tile) — and never changes. A consumer declares the unit it waits
+# on; the semaphore derives both the flag index (via an indexer) and the
+# target (the number of producer tiles covering one consumer unit, i.e. the
+# fiber size). `n_tiles`/`W` stop being kernel arguments: they are properties
+# of the two tilings, so a consumer cannot disagree with the producer about
+# either the index space or the count. That divergence is what produced the
+# trickle hang, the flag_idx mismatch and the tail-publish bug.
+#
+#   case        producer unit         consumer unit            fiber (target)
+#   combine     (m_tile, n_tile)      (m_tile, all N)          ceil(N/tile_N)
+#   allreduce   (m,n) tile on 1 rank  same tile across W ranks W
+#
+# Fan-out vs fan-in: with one flag per consumer unit the wait is a single
+# poll and the publish fans out to every consumer unit a producer tile
+# touches; with one flag per producer unit the publish is single and the wait
+# fans in. Both cases above have fan-out 1 on the local flag array (combine:
+# a tile maps to exactly one m-tile counter; allreduce: one counter per
+# output tile, incremented once per rank), so the counter form is optimal for
+# both — assert that when adding a third case.
+
+
+@dataclass
+class AffineIndexer:
+    """flag = m_tile * stride + base. For regular (non-varlen) tilings."""
+
+    stride: int = 1
+    base: int = 0
+
+    @cute.jit
+    def index(self, batch: Int32, m_tile: Int32) -> Int32:
+        return m_tile * Int32(self.stride) + Int32(self.base)
+
+
+@dataclass
+class RaggedTileIndexer:
+    """flag = tile_offsets[batch] + m_tile — per-batch m-tile bases, i.e. the
+    varlen grouped GEMM's tiling (each expert tiled separately)."""
+
+    tile_offsets: cute.Tensor  # [num_batches] int32, exclusive cumsum
+
+    @cute.jit
+    def index(self, batch: Int32, m_tile: Int32) -> Int32:
+        return self.tile_offsets[batch] + m_tile
+
+
+@dataclass
+class LayoutSemaphore:
+    """Counting semaphore over GEMM output tiles.
+
+    flags:     local view of the counter array (consumers)
+    peer_ptrs: [world] int64 symmetric bases (producers); a 1-entry table
+               means "publish locally only" (push-combine).
+    indexer:   (batch, m_tile) -> flag index, shared by BOTH sides.
+    target:    fiber size — how many producer tiles cover one consumer unit.
+               Compile-time for both supported cases.
+    """
+
+    indexer: object
+    target: cutlass.Constexpr
+    flags: Optional[cute.Tensor] = None
+    peer_ptrs: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def arrive(self, batch: Int32, m_tile: Int32):
+        """Producer: +1 on this tile's counter, on every rank in peer_ptrs.
+        Caller must have ordered its data writes first (async-proxy stores
+        need cp.async.bulk drain + fence.proxy.async — see the GEMM
+        epilogue)."""
+        idx = self.indexer.index(batch, m_tile)
+        num_ranks = cute.size(self.peer_ptrs.shape)
+        for r in cutlass.range(num_ranks):
+            flag_ptr = cute.make_ptr(
+                Int32, self.peer_ptrs[r], cute.AddressSpace.gmem, assumed_align=4
+            )
+            cute.arch.atomic_add(flag_ptr + idx, Int32(1), sem="release", scope="sys")
+
+    @cute.jit
+    def poll(self, batch: Int32, m_tile: Int32):
+        """Single-thread: wait until this consumer unit's fiber is complete."""
+        ptr = self.flags.iterator + self.indexer.index(batch, m_tile)
+        arrived = ld_acquire_sys(ptr)
+        while arrived < Int32(self.target):
+            nanosleep(256)
+            arrived = ld_acquire_sys(ptr)
+
+    @cute.jit
+    def wait_warp(self, batch: Int32, m_tile: Int32):
+        """Warp-collective wait (see ExpertArrivalSemaphore.wait_warp)."""
+        with cute.arch.elect_one():
+            self.poll(batch, m_tile)
+        cute.arch.sync_warp()
+        cute.arch.fence_proxy("async")

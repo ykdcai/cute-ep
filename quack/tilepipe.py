@@ -421,6 +421,14 @@ def build_push_combine_arrays(all_topk, num_experts, rank, world_size, tile_m=12
     rows_home, rows_token, rows_slot_j, rows_expert = [], [], [], []
     for e in range(epr):
         ge = rank * epr + e
+        # Homes are visited in ASCENDING order, which is the row order of this
+        # rank's expert-output buffer (grouped by local expert, then source
+        # rank, then token). Two invariants depend on it and are worth more
+        # than destination fairness: `src_row` below is the list position (so
+        # position == buffer row), and gate indices stay monotone (one poll per
+        # tile instead of per row). Rotating homes to spread destination load
+        # breaks both; if hot-spotting shows up at larger world sizes, rotate
+        # at a granularity that keeps whole tiles contiguous.
         for src in range(world_size):
             hits = np.argwhere(all_topk[src] == ge)  # (token, j) pairs, sorted
             for t, j in hits:
@@ -521,8 +529,12 @@ class DeviceCommPlan:
         self.seg_done.zero_()
 
     def _lists(self, src_buf, dst_peer_ptrs, flag_peer_ptrs):
+        # flag_peer_ptrs=None => pure data movement: the kernel skips segment
+        # bookkeeping and publishes nothing (push-combine, where the consumer
+        # is ordered by the pipeline's barrier rather than an arrival counter).
         return (dyn(src_buf, leading_dim=1, assumed_align=32),
-                from_dlpack(dst_peer_ptrs), from_dlpack(flag_peer_ptrs),
+                from_dlpack(dst_peer_ptrs),
+                from_dlpack(flag_peer_ptrs) if flag_peer_ptrs is not None else None,
                 dyn(self.src_row), dyn(self.dst_slot), dyn(self.dst_rank),
                 dyn(self.seg), dyn(self.seg_done), dyn(self.seg_sizes),
                 Int32(self.n_rows), Int32(self.dst_rows))

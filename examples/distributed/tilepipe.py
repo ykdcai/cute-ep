@@ -10,7 +10,9 @@ Run (2 GPUs):
 """
 
 import argparse
+import datetime
 import functools
+import json
 import os
 
 import numpy as np
@@ -150,7 +152,7 @@ def run_tilepipe(args):
 
     if not args.benchmark:
         pipe.free()
-        return
+        return None
 
     # --- Benchmark ---
     def time_iters(enqueue, iters, warmup):
@@ -220,12 +222,66 @@ def run_tilepipe(args):
         print(f"\nbest: comm_sms={best[0]} oversub={best[1]} "
               f"{results[best]:.3f} ms = {t_serial / results[best]:.2f}x vs serial")
 
+    total_m, gemm_flops = pipe.total_m, 2 * pipe.total_m * args.n * args.hidden
     pipe.free()
+    return dict(
+        tokens=args.tokens, total_m=total_m, K=args.hidden, N=args.n,
+        topk=args.topk, experts=args.experts, world=world_size, num_sms=num_sms,
+        copy=args.copy, gemm_ms=t_gemm_pure,
+        gemm_tflops=gemm_flops / t_gemm_pure / 1e9,
+        dispatch_ms={c: t_disp_pure[c] for c in args.comm_sms_list},
+        serial_ms=t_serial,
+        overlapped_ms={f"{c}/{o}": results[(c, o)]
+                       for c in args.comm_sms_list for o in oversubs},
+    )
+
+
+def write_results(results, args, world_size):
+    """Rank 0 writes the sweep to a timestamped run directory."""
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = (f"dispatch_gemm_{world_size}gpu_{args.copy}_N{args.n}_K{args.hidden}_"
+            f"topk{args.topk}_{stamp}")
+    outdir = os.path.join(args.results_dir, name)
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "results.json"), "w") as f:
+        json.dump({"config": vars(args) | {"world_size": world_size},
+                   "runs": results}, f, indent=2, default=str)
+    lines = [f"# TilePipe dispatch -> GEMM ({world_size} GPUs, copy={args.copy})",
+             "", f"- generated: {stamp}",
+             f"- K={args.hidden} N={args.n} topk={args.topk} "
+             f"experts={args.experts} tile={args.tile_m}x{args.tile_n}",
+             f"- comm SMs: {args.comm_sms_list}; oversub: {[0] + args.oversub_sms_list}",
+             "", "## Summary", "",
+             "| tokens/rank | GEMM ms | best dispatch ms | serial ms | "
+             "best overlapped ms | vs serial |", "|---|---|---|---|---|---|"]
+    for r in results:
+        bo = min(r["overlapped_ms"].values())
+        lines.append(f"| {r['tokens']} | {r['gemm_ms']:.3f} | "
+                     f"{min(r['dispatch_ms'].values()):.3f} | {r['serial_ms']:.3f} | "
+                     f"{bo:.3f} | {r['serial_ms'] / bo:.2f}x |")
+    for r in results:
+        lines += ["", f"## tokens/rank = {r['tokens']} (total_m={r['total_m']})", "",
+                  f"pure GEMM {r['gemm_ms']:.3f} ms ({r['gemm_tflops']:.0f} TFLOPS); "
+                  f"serial {r['serial_ms']:.3f} ms", "",
+                  "| comm SMs | pure dispatch ms | " +
+                  " | ".join(f"ovl +os{o}" for o in [0] + args.oversub_sms_list) + " |",
+                  "|---|---|" + "---|" * (1 + len(args.oversub_sms_list))]
+        for c in args.comm_sms_list:
+            cells = " | ".join(f"{r['overlapped_ms'][f'{c}/{o}']:.3f}"
+                               for o in [0] + args.oversub_sms_list)
+            lines.append(f"| {c} | {r['dispatch_ms'][c]:.3f} | {cells} |")
+    with open(os.path.join(outdir, "results.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\nresults written to {outdir}/ (results.json, results.md)")
 
 
 def main():
     parser = argparse.ArgumentParser(description="TilePipe dispatch + gated grouped GEMM")
-    parser.add_argument("--tokens", type=int, default=4096)
+    parser.add_argument("--tokens", type=int, default=None,
+                        help="single token count (overrides --token-sweep)")
+    parser.add_argument("--token-sweep", type=str, default="2048,4096,8192,16384",
+                        help="comma-separated tokens/rank to sweep")
+    parser.add_argument("--results-dir", type=str, default="bench_results")
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--gemm-n", dest="n", type=int, default=2048,
                         help="GEMM N (per-expert FFN width; 2x intermediate for gate+up)")
@@ -246,7 +302,7 @@ def main():
     parser.add_argument("--publish", choices=["token", "segment"], default="segment",
                         help="flag granularity: per token, or one release per "
                              "(source, expert) segment via local completion counters")
-    parser.add_argument("--comm-sms", type=str, default="8,16,24,32",
+    parser.add_argument("--comm-sms", type=str, default="12,24,36,48",
                         help="comma-separated num_comm_sms values to sweep")
     parser.add_argument("--oversub-sms", type=str, default="0",
                         help="comma-separated GEMM SM oversubscription values to "
@@ -259,6 +315,9 @@ def main():
     args = parser.parse_args()
     args.comm_sms_list = [int(x) for x in args.comm_sms.split(",")]
     args.oversub_sms_list = [int(x) for x in args.oversub_sms.split(",")]
+    token_list = ([args.tokens] if args.tokens is not None
+                  else [int(x) for x in args.token_sweep.split(",")])
+    args.tokens = max(token_list)  # heap must cover the largest run
 
     # Size the NVSHMEM symmetric heap from the actual buffer needs (must be
     # set BEFORE init — the whole heap is reserved up front).
@@ -278,7 +337,18 @@ def main():
           f"device=cuda:{torch.cuda.current_device()} "
           f"({torch.cuda.get_device_name()})")
     try:
-        run_tilepipe(args)
+        results = []
+        for tok in token_list:
+            args.tokens = tok
+            if rank == 0:
+                print(f"\n{'=' * 70}\n=== tokens/rank = {tok} ===\n{'=' * 70}")
+            r = run_tilepipe(args)
+            if r is not None:
+                results.append(r)
+            torch.cuda.synchronize()
+            dist.barrier()
+        if rank == 0 and results:
+            write_results(results, args, dist.get_world_size())
     finally:
         torch.cuda.synchronize()
         dist.barrier()

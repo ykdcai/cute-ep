@@ -743,7 +743,7 @@ class CombineTmaKernel:
 
 
 @cute.jit
-def _publish_segment_tma(
+def _publish_segment(
     seg: Int32,
     count: Int32,
     seg_done: cute.Tensor,
@@ -761,9 +761,9 @@ def _publish_segment_tma(
     if old + count == seg_size:
         sem = ExpertArrivalSemaphore(peer_ptrs=flag_peer_ptrs)
         if cutlass.const_expr(PUSH_COMBINE):
-            # Push-combine: seg = e * world + dst (recv-layout order, no
-            # rotation); the home rank counts total arrived rows in flag[0]
-            # to gate its local reduce.
+            # Push-combine: seg = e * world + home (buffer order, no rotation
+            # — see build_push_combine_arrays). Only used when a counter is
+            # requested; the default push path publishes nothing.
             sem.arrive(seg % world_size, Int32(0), seg_size)
         else:
             e = seg // world_size
@@ -958,24 +958,26 @@ class VarlenAllToAllKernel:
                     for i in range(n):
                         pipes[w].consumer_wait(cons)  # row i staged
 
-                        seg = send_seg[block_start + i]
-                        if seg != cur_seg:
-                            if count > 0:
-                                if pend_seg >= 0:
-                                    # Two boundaries inside one write window
-                                    # (tiny segments): hard-drain the older.
-                                    cute.arch.cp_async_bulk_wait_group(0)
-                                    cute.arch.fence_proxy("async")
-                                    _publish_segment_tma(
-                                        pend_seg, pend_count, seg_done,
-                                        seg_sizes, flag_peer_ptrs,
-                                        local_rank, world_size,
-                                        gate_flags is not None)
-                                pend_seg = cur_seg
-                                pend_count = count
-                                pend_row = i - 1
-                            cur_seg = seg
-                            count = Int32(0)
+                        if cutlass.const_expr(flag_peer_ptrs is not None):
+                            seg = send_seg[block_start + i]
+                            if seg != cur_seg:
+                                if count > 0:
+                                    if pend_seg >= 0:
+                                        # Two boundaries inside one write
+                                        # window (tiny segments): hard-drain.
+                                        cute.arch.cp_async_bulk_wait_group(0)
+                                        cute.arch.fence_proxy("async")
+                                        _publish_segment(
+                                            pend_seg, pend_count, seg_done,
+                                            seg_sizes, flag_peer_ptrs,
+                                            local_rank, world_size,
+                                            gate_flags is not None)
+                                    pend_seg = cur_seg
+                                    pend_count = count
+                                    pend_row = i - 1
+                                cur_seg = seg
+                                count = Int32(0)
+
 
                         slot = send_slot[block_start + i]
                         dst = send_dst[block_start + i]
@@ -996,31 +998,240 @@ class VarlenAllToAllKernel:
                             rel.advance()
                         # Bound in-flight writes; rows <= i - WWIN complete.
                         cute.arch.cp_async_bulk_wait_group(WWIN)
-                        if pend_seg >= 0:
-                            if pend_row <= i - WWIN:
-                                cute.arch.fence_proxy("async")
-                                _publish_segment_tma(
-                                    pend_seg, pend_count, seg_done, seg_sizes,
-                                    flag_peer_ptrs, local_rank, world_size,
-                                    gate_flags is not None)
-                                pend_seg = Int32(-1)
+                        if cutlass.const_expr(flag_peer_ptrs is not None):
+                            if pend_seg >= 0:
+                                if pend_row <= i - WWIN:
+                                    cute.arch.fence_proxy("async")
+                                    _publish_segment(
+                                        pend_seg, pend_count, seg_done, seg_sizes,
+                                        flag_peer_ptrs, local_rank, world_size,
+                                        gate_flags is not None)
+                                    pend_seg = Int32(-1)
+                            count += 1
                         cons.advance()
-                        count += 1
 
                     # Tail: drain everything, publish what's left.
                     if n > 0:
                         cute.arch.cp_async_bulk_wait_group(0)
                         cute.arch.fence_proxy("async")
+                    if cutlass.const_expr(flag_peer_ptrs is not None):
                         if pend_seg >= 0:
-                            _publish_segment_tma(
+                            _publish_segment(
                                 pend_seg, pend_count, seg_done, seg_sizes,
                                 flag_peer_ptrs, local_rank, world_size,
                                 gate_flags is not None)
                         if count > 0:
-                            _publish_segment_tma(
+                            _publish_segment(
                                 cur_seg, count, seg_done, seg_sizes,
                                 flag_peer_ptrs, local_rank, world_size,
                                 gate_flags is not None)
+
+
+# ---------------------------------------------------------------------------
+# SIMT backend for the varlen all-to-all (DEFAULT).
+# ---------------------------------------------------------------------------
+# Warp-cooperative 256-bit volatile/sys stores instead of the bulk engine.
+# Measured faster per SM than the TMA backend at the CTA counts TilePipe
+# actually uses, and much simpler: data stores and the release atomic are both
+# generic-proxy, so a warp only needs sync_warp before publishing — no
+# cp.async.bulk group accounting, no write watermark, no proxy fences.
+#
+# Identical __call__ signature to VarlenAllToAllKernel (so one CommPlan builds
+# launch args for either backend) and the same two modes: optional producer
+# gate (push-combine waits on the local GEMM's tile counters) and dispatch vs
+# push publish. Warps take CONTIGUOUS blocks of the row list so a warp's gate
+# indices are monotone: one poll per tile, not per row.
+
+
+@cute.jit
+def _flush_segment_warp(
+    cur_seg: Int32,
+    count: Int32,
+    seg_done: cute.Tensor,
+    seg_sizes: cute.Tensor,
+    flag_peer_ptrs: cute.Tensor,
+    lane_id: Int32,
+    local_rank: cutlass.Constexpr,
+    world_size: cutlass.Constexpr,
+    PUSH_COMBINE: cutlass.Constexpr,
+):
+    # sync_warp orders all 32 lanes' stores before lane 0's release publish.
+    cute.arch.sync_warp()
+    if lane_id == 0:
+        _publish_segment(cur_seg, count, seg_done, seg_sizes, flag_peer_ptrs,
+                         local_rank, world_size, PUSH_COMBINE)
+
+
+class VarlenAllToAllSimtKernel:
+    """SIMT backend: one warp per contiguous block of the row list."""
+
+    def __init__(self, dtype, hidden, num_warps: int = 16):
+        self.dtype = dtype
+        self.hidden = hidden
+        self.NUM_WARPS = num_warps
+        assert (hidden * dtype.width // 8) % 32 == 0, "row must be 32B-aligned"
+
+    @cute.jit
+    def __call__(
+        self,
+        src_buf: cute.Tensor,
+        dst_peer_ptrs: cute.Tensor,
+        flag_peer_ptrs: Optional[cute.Tensor],  # None -> pure data movement
+        src_row: cute.Tensor,
+        dst_slot: cute.Tensor,
+        dst_rank: cute.Tensor,
+        seg: cute.Tensor,
+        seg_done: cute.Tensor,
+        seg_sizes: cute.Tensor,
+        n_rows: Int32,
+        dst_rows: Int32,
+        num_ctas: Int32,
+        local_rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
+        stream: cuda_driver.CUstream,
+        gate_flags: Optional[cute.Tensor] = None,
+        gate_idx: Optional[cute.Tensor] = None,
+        gate_target: Optional[Int32] = None,
+    ):
+        self.kernel(
+            src_buf, dst_peer_ptrs, flag_peer_ptrs, src_row, dst_slot, dst_rank,
+            seg, seg_done, seg_sizes, n_rows, dst_rows, local_rank, world_size,
+            gate_flags, gate_idx, gate_target,
+        ).launch(
+            grid=[num_ctas, 1, 1],
+            block=[self.NUM_WARPS * 32, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        src_buf: cute.Tensor,
+        dst_peer_ptrs: cute.Tensor,
+        flag_peer_ptrs: cute.Tensor,
+        src_row: cute.Tensor,
+        dst_slot: cute.Tensor,
+        dst_rank: cute.Tensor,
+        seg: cute.Tensor,
+        seg_done: cute.Tensor,
+        seg_sizes: cute.Tensor,
+        n_rows: Int32,
+        dst_rows: Int32,
+        local_rank: cutlass.Constexpr,
+        world_size: cutlass.Constexpr,
+        gate_flags: Optional[cute.Tensor] = None,
+        gate_idx: Optional[cute.Tensor] = None,
+        gate_target: Optional[Int32] = None,
+    ):
+        WARP_SIZE = 32
+        hidden = cutlass.const_expr(self.hidden)
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        warp_id = tidx // WARP_SIZE
+        lane_id = tidx % WARP_SIZE
+        NW = cutlass.const_expr(self.NUM_WARPS)
+
+        dtype = self.dtype
+        COPY_BITS = 256
+        elems_per_copy = COPY_BITS // dtype.width
+        copy_align = COPY_BITS // 8
+        copy_atom_load = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=COPY_BITS)
+        copy_atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=COPY_BITS,
+            memory_scope=cute.nvgpu.common.MemoryScope.SYS,
+            memory_order=cute.nvgpu.common.MemoryOrder.VOLATILE,
+        )
+        thr_layout = cute.make_ordered_layout((1, WARP_SIZE), order=(1, 0))
+        val_layout = cute.make_ordered_layout((1, elems_per_copy), order=(1, 0))
+        thr_copy_load = cute.make_tiled_copy_tv(
+            copy_atom_load, thr_layout, val_layout).get_slice(lane_id)
+        thr_copy_store = cute.make_tiled_copy_tv(
+            copy_atom_store, thr_layout, val_layout).get_slice(lane_id)
+
+        num_src_rows = cute.size(src_buf, mode=[0])
+        src_tensor = cute.make_tensor(
+            src_buf.iterator.align(copy_align),
+            cute.make_ordered_layout((num_src_rows, hidden), order=(1, 0)))
+        tSgS = thr_copy_load.partition_S(src_tensor)
+        frg = cute.make_fragment_like(tSgS[None, 0, 0])
+        hidden_iter = cute.size(tSgS, mode=[2])
+        remote_layout = cute.make_ordered_layout((dst_rows, hidden), order=(1, 0))
+
+        # Contiguous block per warp (keeps gate indices and segments monotone).
+        total_warps = NW * gdim
+        wid = bidx * NW + warp_id
+        per_w = (n_rows + total_warps - 1) // total_warps
+        block_start = wid * per_w
+        n = n_rows - block_start
+        if n > per_w:
+            n = per_w
+        if n < 0:
+            n = Int32(0)
+
+        gsem = ExpertArrivalSemaphore(flags=gate_flags)
+        last_gate = Int32(-1)
+        cur_seg = Int32(-1)
+        count = Int32(0)
+        for i in range(n):
+            idx = block_start + i
+            if cutlass.const_expr(gate_flags is not None):
+                # Producer gate, once per tile: lane 0 acquire-polls, sync_warp
+                # propagates. No proxy fence needed — the reads below are
+                # generic-proxy loads, unlike the TMA backend's G2S.
+                g = gate_idx[idx]
+                if g != last_gate:
+                    if lane_id == 0:
+                        gsem.poll(g, gate_target)
+                    cute.arch.sync_warp()
+                    last_gate = g
+            if cutlass.const_expr(flag_peer_ptrs is not None):
+                # Segment bookkeeping exists only to decide WHO publishes. With
+                # no counter to publish (push-combine: the consumer is ordered
+                # by the pipeline's own barrier, not by an arrival flag), skip
+                # it entirely — no seg_done atomics, no releases.
+                s = seg[idx]
+                if s != cur_seg:
+                    if count > 0:
+                        _flush_segment_warp(cur_seg, count, seg_done, seg_sizes,
+                                            flag_peer_ptrs, lane_id, local_rank,
+                                            world_size, gate_flags is not None)
+                    cur_seg = s
+                    count = Int32(0)
+
+            row = src_row[idx]
+            slot = dst_slot[idx]
+            dst = dst_rank[idx]
+            remote_ptr = cute.make_ptr(
+                dtype, dst_peer_ptrs[dst], cute.AddressSpace.gmem,
+                assumed_align=copy_align)
+            tDgD = thr_copy_store.partition_D(
+                cute.make_tensor(remote_ptr, remote_layout))
+            for k in range(hidden_iter):
+                cute.copy(thr_copy_load, tSgS[None, row, k], frg)
+                cute.copy(thr_copy_store, frg, tDgD[None, slot, k])
+            if cutlass.const_expr(flag_peer_ptrs is not None):
+                count += 1
+
+        if cutlass.const_expr(flag_peer_ptrs is not None):
+            if count > 0:
+                _flush_segment_warp(cur_seg, count, seg_done, seg_sizes,
+                                    flag_peer_ptrs, lane_id, local_rank,
+                                    world_size, gate_flags is not None)
+
+
+def make_varlen_all_to_all(dtype, hidden, impl="simt", num_warps=16,
+                           num_stages=12, workers=4):
+    """Build a varlen all-to-all kernel. `impl="simt"` (default) is the warp
+    copy backend; `impl="tma"` is the bulk-async backend. Both take the same
+    launch arguments, so a CommPlan drives either."""
+    if impl == "simt":
+        return VarlenAllToAllSimtKernel(dtype, hidden, num_warps=num_warps)
+    if impl == "tma":
+        return VarlenAllToAllKernel(dtype, hidden, num_stages=num_stages,
+                                    workers=workers)
+    raise ValueError(f"unknown varlen all-to-all impl: {impl}")
 
 
 # ---------------------------------------------------------------------------
@@ -2157,7 +2368,7 @@ def write_kernel_results(tag, rows, meta, results_dir="bench_results"):
 
 def run_push_combine(num_tokens, hidden, num_experts, topk,
                     ctas_list, num_stages, workers,
-                    warmup_iterations, iterations):
+                    warmup_iterations, iterations, impl="simt", num_warps=16):
     """Standalone correctness test + CTA-sweep benchmark for the push-combine
     mode of VarlenAllToAllKernel (reverse dispatch: each rank pushes its expert-
     GEMM output rows back to each token's home rank). The producing GEMM is
@@ -2172,8 +2383,9 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
     torch.manual_seed(42 + rank)
     if rank == 0:
         print(f"\nPush-combine test: tokens/rank={num_tokens} N={hidden} "
-              f"experts={num_experts} topk={topk} stages={num_stages} "
-              f"workers={workers} world={world_size}", flush=True)
+              f"experts={num_experts} topk={topk} impl={impl} "
+              f"(stages={num_stages} workers={workers} warps={num_warps}) "
+              f"world={world_size}", flush=True)
 
     topk_indices = torch.randint(
         0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
@@ -2216,8 +2428,9 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
     tile_flags = torch.full((local_tiles,), 1 << 20, dtype=torch.int32,
                             device=device)  # producer emulated: always ready
 
-    kern = VarlenAllToAllKernel(cutlass.BFloat16, hidden,
-                                num_stages=num_stages, workers=workers)
+    kern = make_varlen_all_to_all(cutlass.BFloat16, hidden, impl=impl,
+                                  num_warps=num_warps, num_stages=num_stages,
+                                  workers=workers)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = {c: cute.compile(kern, *dplan.compile_args(
         d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, rank, world_size, stream,
@@ -2299,7 +2512,7 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
 
 def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
                      ctas_list, num_stages, workers,
-                     warmup_iterations, iterations):
+                     warmup_iterations, iterations, impl="simt", num_warps=16):
     """Standalone correctness test + CTA-sweep benchmark for
     VarlenAllToAllKernel (TilePipe-style host-precomputed send list, counting-
     semaphore publish). Reports GB/s and GB/s-per-SM so the SM-efficiency
@@ -2313,8 +2526,9 @@ def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
     torch.manual_seed(42 + rank)
     if rank == 0:
         print(f"\nTMA dispatch test: tokens/rank={num_tokens} hidden={hidden} "
-              f"experts={num_experts} topk={topk} stages={num_stages} "
-              f"workers={workers} world={world_size}", flush=True)
+              f"experts={num_experts} topk={topk} impl={impl} "
+              f"(stages={num_stages} workers={workers} warps={num_warps}) "
+              f"world={world_size}", flush=True)
 
     topk_indices = torch.randint(
         0, num_experts, (num_tokens, topk), dtype=torch.int32, device=device)
@@ -2343,8 +2557,9 @@ def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
     dplan = plan.to_device(device)
     split_sizes_t = dev(split_sizes.astype(np.int32))
 
-    kern = VarlenAllToAllKernel(cutlass.BFloat16, hidden,
-                                num_stages=num_stages, workers=workers)
+    kern = make_varlen_all_to_all(cutlass.BFloat16, hidden, impl=impl,
+                                  num_warps=num_warps, num_stages=num_stages,
+                                  workers=workers)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = cute.compile(kern, *dplan.compile_args(
         input_buf, recv_peer_ptrs, flag_peer_ptrs, ctas_list[0],
@@ -2504,8 +2719,9 @@ def main():
                          "test + CTA-sweep benchmark (GB/s per SM), then exit. "
                          "Uses --num_tokens/--hidden/--num_experts/--topk and "
                          "the iteration counts.")
-    td.add_argument("--dispatch-ctas", default="1,2,4,8,16,32",
-                    help="[tma-dispatch] comma-separated CTA counts to sweep.")
+    td.add_argument("--dispatch-ctas", default="12,24,36,48",
+                    help="[tma-dispatch/push-combine] comma-separated CTA "
+                         "(= comm SM) counts to sweep.")
     td.add_argument("--dispatch-tma-stages", default=12, type=int,
                     help="[tma-dispatch] SMEM stage budget (14 KB each at "
                          "hidden=7168).")
@@ -2518,6 +2734,11 @@ def main():
                     help="Run only the push-combine (reverse dispatch) "
                          "correctness test + CTA sweep, then exit. Uses "
                          "--hidden as the GEMM N.")
+    td.add_argument("--comm-impl", default="simt", choices=["simt", "tma"],
+                    help="[tma-dispatch/push-combine] varlen all-to-all backend "
+                         "(default simt: faster per SM at TilePipe CTA counts).")
+    td.add_argument("--comm-warps", default=16, type=int,
+                    help="[simt] warps per comm CTA.")
     td.add_argument("--dispatch-tma-workers", default=4, type=int,
                     help="[tma-dispatch] producer/consumer warp pairs per CTA, "
                          "each with a private stage partition and sub-block.")
@@ -2583,7 +2804,8 @@ def main():
                        num_stages=args.dispatch_tma_stages,
                        workers=args.dispatch_tma_workers,
                        warmup_iterations=args.warmup_iterations,
-                       iterations=args.iterations)
+                       iterations=args.iterations,
+                       impl=args.comm_impl, num_warps=args.comm_warps)
                 if r:
                     rows.extend(r)
                 torch.cuda.synchronize()
@@ -2594,6 +2816,7 @@ def main():
                     topk=args.topk, experts=args.num_experts,
                     stages=args.dispatch_tma_stages,
                     workers=args.dispatch_tma_workers,
+                    impl=args.comm_impl, warps=args.comm_warps,
                     tokens=token_list), results_dir=args.results_dir)
         finally:
             torch.cuda.synchronize()

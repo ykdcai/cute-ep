@@ -36,12 +36,11 @@ import cuda.bindings.driver as cuda_driver
 import nvshmem.core
 
 from moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
-                      CombineTmaKernel, VarlenAllToAllKernel)
+                      CombineTmaKernel, make_varlen_all_to_all)
 
 from quack.gemm import gemm as quack_gemm
 from quack.tilepipe import (build_combine_metadata, plan_combine,
                             peer_ptr_tensor, dyn)
-from quack.tilepipe_sync import wait_flag
 
 # Stage prints are hang diagnostics — they must not sit in a stdio buffer.
 print = functools.partial(print, flush=True)
@@ -178,16 +177,18 @@ def run(args):
     stage_rows = pplan.dst_rows
     staging = nvshmem.core.tensor((stage_rows, n), dtype=torch.bfloat16)
     staging.fill_(0)
-    arrivals = nvshmem.core.tensor((1,), dtype=torch.int32)
-    arrivals.fill_(0)
     stage_peer_ptrs = peer_ptr_tensor(staging, world_size, device)
-    arriv_peer_ptrs = peer_ptr_tensor(arrivals, world_size, device)
+    # No arrival counter: the push kernel is pure data movement (flag_peer_ptrs
+    # = None => no segment bookkeeping, no releases). The local reduce is
+    # ordered against PEERS' pushes by the pipeline's existing barrier, not by
+    # an in-band flag — so it runs after that barrier, outside the overlapped
+    # region (it is ~2% of the step).
     dplan = pplan.to_device(device)
-    push_kernel = VarlenAllToAllKernel(cutlass.BFloat16, n,
-                                       num_stages=args.push_stages,
-                                       workers=args.push_workers)
+    push_kernel = make_varlen_all_to_all(
+        cutlass.BFloat16, n, impl=args.comm_impl, num_warps=args.comm_warps,
+        num_stages=args.push_stages, workers=args.push_workers)
     push_args = lambda ctas, strm: dplan.args(
-        d_buf, stage_peer_ptrs, arriv_peer_ptrs, ctas, strm,
+        d_buf, stage_peer_ptrs, None, ctas, strm,
         gate_flags=tile_flags_local, gate_target=n_tiles)
     print(f"[rank {rank}] push-combine: {pplan.n_rows} rows, staging "
           f"{stage_rows * n * 2 / 1e9:.3f} GB")
@@ -206,22 +207,17 @@ def run(args):
                                        world_size, c, cur())
                        for c in args.combine_ctas_list}
     push_compiled = {c: cute.compile(push_kernel, *dplan.compile_args(
-        d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, rank, world_size, cur(),
+        d_buf, stage_peer_ptrs, None, c, rank, world_size, cur(),
         gate_flags=tile_flags_local, gate_target=n_tiles))
         for c in args.combine_ctas_list}
-    arrivals_target = Int32(stage_rows)
-    wait_compiled = cute.compile(
-        wait_flag, from_dlpack(arrivals), Int32(0), arrivals_target, cur())
     print(f"[rank {rank}] combine + push kernels compiled")
 
     def launch_push(c, strm):
         push_compiled[c](*push_args(c, cs(strm)))
 
     def launch_reduce(strm):
-        # Gate the local reduce on arrivals, then a plain torch contraction —
-        # both enqueued, no host sync (a spinning gate + host CUDA call would
-        # deadlock).
-        wait_compiled(from_dlpack(arrivals), Int32(0), arrivals_target, cs(strm))
+        # Plain local contraction. CALLER MUST have barriered after the pushes:
+        # stream order covers only this rank's push kernel, not the peers'.
         with torch.cuda.stream(strm):
             torch.sum(staging.view(args.tokens, args.topk, n), dim=1,
                       out=combine_out)
@@ -230,7 +226,6 @@ def run(args):
         tile_flags.fill_(0)
         tile_flags_local.zero_()
         dplan.reset()
-        arrivals.fill_(0)
         combine_out.zero_()
         torch.cuda.synchronize()
         dist.barrier(device_ids=[rank])
@@ -327,6 +322,7 @@ def run(args):
     reset()
     launch_gemm(publish=True, local_publish=True)
     launch_push(c0, comm_stream)
+    barrier()          # peers' pushes complete here
     launch_reduce(comm_stream)
     barrier()
     if not check("serial GEMM->push-combine"):
@@ -338,12 +334,13 @@ def run(args):
         # produces them. The reduce follows on the same stream behind the
         # arrival gate.
         launch_push(c_ctas, comm_stream)
-        launch_reduce(comm_stream)
         launch_gemm(publish=True, local_publish=True,
                     max_clusters=num_sms - c_ctas, stream=gemm_stream)
 
     reset()
     overlapped_push(c0)
+    barrier()          # peers' pushes complete here
+    launch_reduce(comm_stream)
     barrier()
     if not check("overlapped GEMM->push-combine"):
         raise SystemExit("push-combine overlapped correctness FAILED")
@@ -352,7 +349,6 @@ def run(args):
         nvshmem.core.free_tensor(d_buf)
         nvshmem.core.free_tensor(tile_flags)
         nvshmem.core.free_tensor(staging)
-        nvshmem.core.free_tensor(arrivals)
 
     if not args.benchmark:
         free_symmetric()
@@ -408,11 +404,13 @@ def run(args):
               for c in args.combine_ctas_list}
 
     def serial_push(c):
+        # Reduce excluded: it needs a cross-rank barrier, so it is measured
+        # separately (t_reduce) and added to both serial and overlapped.
         launch_gemm(publish=True, local_publish=True, stream=comm_stream)
         launch_push(c, comm_stream)
-        launch_reduce(comm_stream)
 
     t_push_serial = time_iters(lambda: serial_push(c_serial), pre_reset=True)
+    t_reduce = time_iters(lambda: launch_reduce(comm_stream), pre_reset=False)
     t_push_over = {c: time_iters(lambda: overlapped_push(c), pre_reset=True)
                    for c in args.combine_ctas_list}
 
@@ -426,6 +424,7 @@ def run(args):
         print(f"serial (GEMM then combine @{c_serial} CTAs): {t_serial:8.3f} ms")
         print(f"serial (GEMM then push-combine @{c_serial} CTAs): "
               f"{t_push_serial:8.3f} ms")
+        print(f"local reduce (after barrier, both paths): {t_reduce:8.3f} ms")
         print(f"\n{'ctas':>6} {'pull-ovl':>10} {'vs ser':>8} {'vs ideal':>9}"
               f" | {'push-ovl':>10} {'vs ser':>8} {'vs push-ser':>12}")
         for c in args.combine_ctas_list:
@@ -443,6 +442,7 @@ def run(args):
         gemm_tflops=2 * total_m * n * k / t_gemm_plain / 1e9,
         publish_overhead_pct=(t_gemm_pub / t_gemm_plain - 1) * 100,
         serial_pull_ms=t_serial, serial_push_ms=t_push_serial,
+        reduce_ms=t_reduce,
         serial_ctas=c_serial,
         combine_ms={c: t_comb[c] for c in args.combine_ctas_list},
         pull_overlapped_ms={c: t_over[c] for c in args.combine_ctas_list},
@@ -522,7 +522,12 @@ def main():
     parser.add_argument("--hchunk", type=int, default=2048,
                         help="combine bulk tile elems (must divide gemm-n)")
     parser.add_argument("--combine-stages", type=int, default=8)
-    parser.add_argument("--combine-ctas", type=str, default="8,16,32,64")
+    parser.add_argument("--combine-ctas", type=str, default="12,24,36,48",
+                        help="comma-separated combine CTA (= comm SM) counts")
+    parser.add_argument("--comm-impl", choices=["simt", "tma"], default="simt",
+                        help="push-combine backend (default simt)")
+    parser.add_argument("--comm-warps", type=int, default=16,
+                        help="[simt] warps per push-combine CTA")
     parser.add_argument("--push-stages", type=int, default=12,
                         help="SMEM stage budget for the push-combine kernel")
     parser.add_argument("--push-workers", type=int, default=4,
