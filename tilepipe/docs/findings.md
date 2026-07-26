@@ -6,7 +6,7 @@
 gates the SM100 varlen_m grouped GEMM on per-expert token-arrival counters.
 Verified on B200: numerically correct, waits key on *per-expert* counters (releasing
 experts in reverse order works), partial counts do not release an expert, and the
-ungated path is untouched. Test: `tests/test_gemm_tilepipe_gating.py`.
+ungated path is untouched. Test: `tilepipe/tests/test_gemm_tilepipe_gating.py`.
 
 ## Key findings
 
@@ -34,7 +34,7 @@ ungated path is untouched. Test: `tests/test_gemm_tilepipe_gating.py`.
 - `nanosleep`'s effective delay is far below nominal; treat it as a backoff hint, never
   as a timing primitive.
 
-## Phase 2: dispatch kernel (`examples/distributed/tilepipe.py`) — works on 2 GPUs
+## Phase 2: dispatch kernel (`tilepipe/dispatch_gemm.py`) — works on 2 GPUs
 
 Expert-major / rank-minor send list (host-precomputed, destination rotated by source
 rank), warp-cooperative 256-bit NVLink copies into the receiver's expert-grouped recv

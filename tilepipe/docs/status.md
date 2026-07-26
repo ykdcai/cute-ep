@@ -7,11 +7,11 @@ topk=8, experts = 32 x world_size. Raw data in `bench_results/`._
 
 Two pipelines are functionally correct end to end:
 
-- **dispatch -> gated GEMM** (`examples/distributed/tilepipe.py`)
+- **dispatch -> gated GEMM** (`tilepipe/dispatch_gemm.py`)
 - **GEMM -> combine**, both pull and push variants
-  (`examples/distributed/tilepipe_gemm_combine.py`)
+  (`tilepipe/gemm_combine.py`)
 
-Kernel-level tests with their own correctness gates live in `moe_comm.py`
+Kernel-level tests with their own correctness gates live in `tilepipe/moe_comm.py`
 (`--test-tma-dispatch`, `--test-push-combine`, `--test-tma-combine`); all
 sweep tokens 2048->16384 and write timestamped results.
 
@@ -107,7 +107,7 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
    expert's flags. The predicate is compile-time gated to `cluster != 1x1`,
    so the 1x1 PTX is unchanged. Picking this up also requires every host
    that builds `tile_offsets` to switch to CTA tile M (`tile_M // 2`).
-   Sweep both with `examples/distributed/tilepipe_gemm_tune.py` (single GPU).
+   Sweep both with `tilepipe/gemm_tune.py` (single GPU).
 2. **Publish to all peers with ONE instruction (multimem) — NOT for
    gemm+combine.** `distributed_gemm_all_reduce_blackwell.py` publishes with
    `cutlass.utils.distributed.multimem_red_add1(lock_ptr, order="release",
@@ -137,7 +137,7 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
    instead of predicating. Either solution works; ours keeps the flag space
    equal to the consumer's tile space, which the combine gate needs.
 3. **push-combine transfer redesign — POSTPONED, analysis complete.**
-   See `tilepipe_combine_design.md`. Summary: destination order is free (the
+   See `tilepipe/docs/combine_design.md`. Summary: destination order is free (the
    reduce can permute), which turns each segment into a contiguous ->
    contiguous transfer and lets consecutive rows merge into one bulk copy.
    Full-width 1-D beats 2-D column slices (no tensormaps); SMEM staging — not

@@ -1,8 +1,8 @@
 # TilePipe-EPLB: fused dispatch + expert-weight transfer — design notes
 
 Companion to `tilepipe.md` ("Implement Expert Parallel Load Balancing") and
-`tilepipe_findings.md`. Records the design discussion, the tradeoffs weighed,
-and the implementation plan. Code: `examples/distributed/tilepipe_eplb.py`.
+`tilepipe/docs/findings.md`. Records the design discussion, the tradeoffs weighed,
+and the implementation plan. Code: `tilepipe/eplb.py (removed; see git history)`.
 
 ## 1. Idea
 
@@ -145,7 +145,7 @@ EDF, so we validate now and the ordering generalizes.
    references, bandwidth sweep reporting GB/s and per-weight time
    (= time-to-first-ready-weight, the number that sets the comm-SM budget).
    Awaiting the 2-GPU run:
-   `torchrun --nproc-per-node 2 examples/distributed/tilepipe_eplb.py`
+   `torchrun --nproc-per-node 2 tilepipe/eplb.py (removed; see git history)`
 3. **[TODO] GEMM gate**: add the `wflag` poll next to the existing token-flag
    wait in `gemm_sm100.py` (same lane-0 acquire/sys poll + `ready_batch_idx`
    caching; local-weight experts get their wflag preset to 1 so the gate is

@@ -32,7 +32,7 @@ kernels just walk precomputed lists and count.
    enqueued FIRST on a high-priority stream so its CTAs win placement, and
    with oversubscription the GEMM's surplus CTAs backfill SMs as dispatch
    retires.
-5. **Launch discipline** (`quack/tilepipe.py`, class `TilePipe`): every kernel
+5. **Launch discipline** (`tilepipe/plan.py`, class `TilePipe`): every kernel
    warm-up-EXECUTED before overlap (lazy module load deadlocks against a
    spinning GEMM); `reset()` zeroes flags AND `seg_done`; the overlapped
    section is launches only — any host CUDA call that device-syncs deadlocks.
@@ -55,10 +55,10 @@ kernels just walk precomputed lists and count.
 The semaphore is a *predicate object* handed to the consumer
 (`sem.wait_warp(e, target)` in `gemm_sm100.py`) — swapping the class swaps
 the readiness condition with zero consumer changes (EPLB: tokens AND weight
-arrived; see tilepipe_eplb_design.md). Weight rows are just big token
+arrived; see tilepipe/docs/eplb_design.md). Weight rows are just big token
 segments in the same work list. Files: `tilepipe.md` (design),
-`tilepipe_findings.md` (measured findings), `quack/tilepipe.py` (pipeline),
-`examples/distributed/tilepipe.py` (driver), `moe_comm.py --test-tma-dispatch`
+`tilepipe/docs/findings.md` (measured findings), `tilepipe/plan.py` (pipeline),
+`tilepipe/dispatch_gemm.py` (driver), `tilepipe/moe_comm.py --test-tma-dispatch`
 (kernel-level test/bench).
 
 ## Next: GEMM → combine (epilogue side)
