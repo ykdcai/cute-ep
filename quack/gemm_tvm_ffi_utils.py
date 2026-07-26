@@ -12,6 +12,10 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import torch2cute_dtype_map
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
+from tilepipe.args import (
+    fake_varlen_fields as tilepipe_fake_varlen_fields,
+    varlen_fields as tilepipe_varlen_fields,
+)
 
 
 def div_for_dtype(dtype):
@@ -87,28 +91,20 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
     )
 
 
-def make_varlen_args(
-    cu_seqlens_m, cu_seqlens_k, A_idx, ready_flags=None, tile_flag_ptrs=None, tile_offsets=None
-):
+def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, tilepipe=None):
     if cu_seqlens_m is None and cu_seqlens_k is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
         mCuSeqlensK=cu_seqlens_k,
         mAIdx=A_idx,
-        mReadyFlags=ready_flags,
-        mTileFlagPtrs=tile_flag_ptrs,
-        mTileOffsets=tile_offsets,
+        **tilepipe_varlen_fields(tilepipe),
     )
 
 
 def make_fake_varlen_args(
     varlen_m, varlen_k, gather_A, aidx_len, has_ready_flags=False, tile_flag_world=0
 ):
-    # tile_flag_world is the number of peer flag arrays (0 = no tile flags). It
-    # is STATIC on purpose: the epilogue's publish loop is per-rank, and a
-    # dynamic extent turns each publish into an unroll ladder over gmem loads.
-    has_tile_flags = tile_flag_world > 0
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
@@ -122,21 +118,7 @@ def make_fake_varlen_args(
         mAIdx=(
             fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
         ),
-        mReadyFlags=(
-            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
-            if has_ready_flags
-            else None
-        ),
-        mTileFlagPtrs=(
-            fake_tensor(Int64, (tile_flag_world,), leading_dim=0, divisibility=1)
-            if has_tile_flags
-            else None
-        ),
-        mTileOffsets=(
-            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
-            if has_tile_flags
-            else None
-        ),
+        **tilepipe_fake_varlen_fields(has_ready_flags, tile_flag_world),
     )
 
 

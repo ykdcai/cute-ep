@@ -18,7 +18,7 @@ array with `cta_tile_m()`, not `tile_M`. Getting that wrong is silent — the
 counters just never reach their target.
 
 Run (one GPU, no NVSHMEM/torchrun needed):
-    CUDA_VISIBLE_DEVICES=0 python examples/distributed/tilepipe_gemm_tune.py
+    CUDA_VISIBLE_DEVICES=0 python tilepipe/gemm_tune.py
 """
 
 import argparse
@@ -31,6 +31,7 @@ import numpy as np
 import torch
 
 from quack.gemm import gemm as quack_gemm
+from tilepipe.args import TilePipeArgs
 
 print = functools.partial(print, flush=True)
 
@@ -169,9 +170,10 @@ def main():
                        tile_M=tile_m, tile_N=tile_n,
                        cluster_M=cluster_m, cluster_N=cluster_n,
                        persistent=True, cu_seqlens_m=cu,
-                       tile_flag_ptrs=ptrs if publish else None,
-                       tile_flag_offsets=tile_off if publish else None,
-                       tile_flag_stride=stride)
+                       tilepipe=TilePipeArgs(
+                           tile_flag_ptrs=ptrs if publish else None,
+                           tile_flag_offsets=tile_off if publish else None,
+                           tile_flag_stride=stride))
 
         tag = f"{tile_m}x{tile_n} c{cluster_m}x{cluster_n}"
         try:

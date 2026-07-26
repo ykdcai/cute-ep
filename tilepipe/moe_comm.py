@@ -45,8 +45,8 @@ from cutlass.cutlass_dsl import Int32
 import cuda.bindings.driver as cuda_driver
 from cuda.core import Device
 
-from quack.tilepipe import dyn
-from quack.tilepipe_sync import ExpertArrivalSemaphore, flag_trickle
+from tilepipe.plan import dyn
+from tilepipe.sync import ExpertArrivalSemaphore, flag_trickle
 
 import nvshmem.core
 
@@ -500,7 +500,7 @@ def _per_thread_view(tile_1d, vec_size, consumer_threads, ctid):
 # NOT a dynamic-shape artifact: it reproduces identically with statically
 # compiled shapes, so it predates the mark_layout_dynamic change. It also
 # likely explains why the pull-combine path reports rel_err ~8e-3 in
-# examples/distributed/tilepipe_gemm_combine.py while the push-combine path
+# tilepipe/gemm_combine.py while the push-combine path
 # reports ~3e-3 on the same data.
 # First suspect: the consumer releases stages with a raw
 # `tma_pipeline.sync_object_empty.arrive(cons.index, consumer_mask)` instead
@@ -782,7 +782,7 @@ class VarlenAllToAllKernel:
     producer's counter says it exists (push-combine waits on the local GEMM's
     tile flags). `hidden` is compile-time (SMEM stage size).
 
-    Instantiate via quack.tilepipe.plan_dispatch / plan_combine, which build
+    Instantiate via tilepipe.plan.plan_dispatch / plan_combine, which build
     the row list and hand back a CommPlan that assembles launch arguments in
     the one correct order."""
 
@@ -2115,7 +2115,7 @@ def run_tma_combine(num_tokens, hidden, num_experts, topk,
     tile and publishes the counters data-before-flag — so a correct combine
     output proves the gate actually waits. Benchmark compares gated (flags
     pre-satisfied) against the ungated CombineTmaKernel."""
-    from quack.tilepipe import build_recv_metadata
+    from tilepipe.plan import build_recv_metadata
 
     TILE_M = 128
     rank = dist.get_rank()
@@ -2374,7 +2374,7 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
     GEMM output rows back to each token's home rank). The producing GEMM is
     emulated by pre-satisfied tile flags, so this measures pure push
     bandwidth; `hidden` here is the GEMM's N."""
-    from quack.tilepipe import plan_combine, build_push_combine_arrays
+    from tilepipe.plan import plan_combine, build_push_combine_arrays
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -2517,7 +2517,7 @@ def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
     VarlenAllToAllKernel (TilePipe-style host-precomputed send list, counting-
     semaphore publish). Reports GB/s and GB/s-per-SM so the SM-efficiency
     claim vs the SIMT dispatch is directly checkable."""
-    from quack.tilepipe import plan_dispatch, build_recv_metadata, build_send_arrays
+    from tilepipe.plan import plan_dispatch, build_recv_metadata, build_send_arrays
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()

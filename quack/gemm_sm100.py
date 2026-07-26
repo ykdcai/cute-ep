@@ -25,7 +25,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
-from quack.tilepipe_sync import ExpertArrivalSemaphore, publish_tile_flag
+from tilepipe.sync import ExpertArrivalSemaphore, publish_tile_flag
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -1724,13 +1724,13 @@ class GemmSm100(GemmTmaBase):
                 # verification. Two things to do when picking it up:
                 #   1. The flag index space counts CTA tiles, and 2-CTA halves
                 #      the CTA tile M. Every host that builds tile_offsets
-                #      (quack/tilepipe.py build_combine_metadata, plan_combine,
+                #      (tilepipe/plan.py build_combine_metadata, plan_combine,
                 #      and the drivers' n_tiles) must use tile_M // 2, not
                 #      tile_M. Getting this wrong is silent: counters simply
                 #      never reach target and the consumer hangs.
                 #   2. The overhang predicate below is already in place and
                 #      verified at c1x1/c2x1/c1x2/c2x2 by
-                #      examples/distributed/tilepipe_gemm_tune.py, which checks
+                #      tilepipe/gemm_tune.py, which checks
                 #      exact flag counts per config.
                 if const_expr(varlen_params.mTileFlagPtrs is not None):
                     # The wait_group below is a no-op only while the epilogue's

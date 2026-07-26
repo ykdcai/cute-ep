@@ -1,5 +1,5 @@
 """
-TilePipe GEMM -> combine overlap (see tilepipe_guide.md): the grouped GEMM is
+TilePipe GEMM -> combine overlap (see tilepipe/docs/guide.md): the grouped GEMM is
 the PRODUCER — its epilogue publishes per-m-tile completion counters to every
 rank (quack_gemm tile_flag_ptrs) — and the gated TMA combine is the CONSUMER,
 pulling each token's topk expert-output rows from peers once their tiles are
@@ -12,7 +12,7 @@ pipeline). Deterministic per-rank seeds let every rank rebuild the peers'
 GEMM outputs for the reference combine.
 
 Run (2 GPUs):
-    torchrun --nproc-per-node 2 examples/distributed/tilepipe_gemm_combine.py
+    torchrun --nproc-per-node 2 tilepipe/gemm_combine.py
 """
 
 import argparse
@@ -35,12 +35,13 @@ import cuda.bindings.driver as cuda_driver
 
 import nvshmem.core
 
-from moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
-                      CombineTmaKernel, make_varlen_all_to_all)
+from tilepipe.moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
+                               CombineTmaKernel, make_varlen_all_to_all)
 
 from quack.gemm import gemm as quack_gemm
-from quack.tilepipe import (build_combine_metadata, plan_combine,
-                            peer_ptr_tensor, dyn)
+from tilepipe.args import TilePipeArgs
+from tilepipe.plan import (build_combine_metadata, plan_combine,
+                           peer_ptr_tensor, dyn)
 
 # Stage prints are hang diagnostics — they must not sit in a stdio buffer.
 print = functools.partial(print, flush=True)
@@ -137,8 +138,9 @@ def run(args):
                 tile_M=args.tile_m, tile_N=args.tile_n, cluster_M=1, cluster_N=1,
                 persistent=True, cu_seqlens_m=cu_seqlens_m,
                 max_active_clusters=max_clusters,
-                tile_flag_ptrs=ptrs,
-                tile_flag_offsets=tile_offsets_t if publish else None)
+                tilepipe=TilePipeArgs(
+                    tile_flag_ptrs=ptrs,
+                    tile_flag_offsets=tile_offsets_t if publish else None))
 
     # --- Combine kernel (gated; hchunk must divide N) ---
     assert n % args.hchunk == 0, "--hchunk must divide --gemm-n"

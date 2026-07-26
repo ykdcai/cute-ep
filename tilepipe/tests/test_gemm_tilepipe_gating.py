@@ -25,8 +25,10 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
-from quack.cute_dsl_utils import get_device_capacity, nanosleep
+from quack.cute_dsl_utils import get_device_capacity
+from tilepipe.sync import nanosleep
 from quack.gemm import gemm as quack_gemm
+from tilepipe.args import TilePipeArgs
 
 
 requires_sm100 = pytest.mark.skipif(
@@ -92,7 +94,7 @@ def _run_gated_gemm(A, B, out, cu_seqlens_m, flags, max_active_clusters=None):
         cluster_N=1,
         persistent=True,
         cu_seqlens_m=cu_seqlens_m,
-        expert_ready_flags=flags,
+        tilepipe=TilePipeArgs(expert_ready_flags=flags),
         max_active_clusters=max_active_clusters,
     )
 

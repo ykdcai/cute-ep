@@ -1,12 +1,12 @@
 """
 TilePipe example/benchmark driver: MoE dispatch <-> grouped-GEMM overlap via
 per-expert counting semaphores (see tilepipe.md). The kernel, metadata
-builders, and the launch/reset/warm-up discipline live in quack.tilepipe —
+builders, and the launch/reset/warm-up discipline live in tilepipe.plan —
 this file only builds synthetic inputs, checks correctness against
 references, and benchmarks.
 
 Run (2 GPUs):
-    torchrun --nproc-per-node 2 examples/distributed/tilepipe.py
+    torchrun --nproc-per-node 2 tilepipe/dispatch_gemm.py
 """
 
 import argparse
@@ -19,9 +19,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from moe_comm import torchrun_uid_init_bcast, torchrun_finalize
+from tilepipe.moe_comm import torchrun_uid_init_bcast, torchrun_finalize
 
-from quack.tilepipe import TilePipe, build_send_arrays
+from tilepipe.plan import TilePipe, build_send_arrays
 
 # Stage prints are hang diagnostics — they must not sit in a stdio buffer.
 print = functools.partial(print, flush=True)
@@ -103,7 +103,7 @@ def run_tilepipe(args):
     print(f"[rank {rank}] weights allocated")
 
     # --- Pipeline (metadata, symmetric buffers, compile, warm-up, validation
-    # all happen inside; the deadlock discipline lives in quack.tilepipe) ---
+    # all happen inside; the deadlock discipline lives in tilepipe.plan) ---
     pipe = TilePipe(
         input_data=input_data,
         weights=weights,

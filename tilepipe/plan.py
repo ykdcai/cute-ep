@@ -25,7 +25,7 @@ go through this class rather than re-implementing it:
    so its CTAs are resident before the GEMM fills the machine; the GEMM's
    surplus CTAs stay pending and backfill SMs as dispatch retires.
 
-nvshmem is imported lazily so `import quack.tilepipe` works on single-GPU
+nvshmem is imported lazily so `import tilepipe.plan` works on single-GPU
 machines (e.g. for the metadata builders in unit tests).
 """
 
@@ -45,7 +45,8 @@ from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
 from quack.gemm import gemm as quack_gemm
-from quack.tilepipe_sync import ExpertArrivalSemaphore
+from tilepipe.args import TilePipeArgs
+from tilepipe.sync import ExpertArrivalSemaphore
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +634,7 @@ class TilePipe:
         num_experts,
         tile_m=128,
         # 128x256 is the fastest cluster-1x1 config measured by
-        # examples/distributed/tilepipe_gemm_tune.py at the DSv3 shape
+        # tilepipe/gemm_tune.py at the DSv3 shape
         # (5.66 ms / 1360 TFLOPS vs 7.60 ms / 1012 at 128x128). It also halves
         # the number of tile-flag publishes per row, which drops the publish
         # overhead from ~+15% to ~+2%.
@@ -739,8 +740,8 @@ class TilePipe:
         log(f"compiling dispatch kernel (copy={copy_engine} publish={publish})...")
         if copy_engine == "tma":
             # The TMA dispatch kernel lives with the other comm kernels in
-            # examples/distributed/moe_comm.py (alongside CombineTmaKernel).
-            from moe_comm import VarlenAllToAllKernel
+            # tilepipe/moe_comm.py (alongside CombineTmaKernel).
+            from tilepipe.moe_comm import VarlenAllToAllKernel
 
             self._tma_kernel = VarlenAllToAllKernel(
                 cutlass.BFloat16, hidden, num_stages=tma_stages,
@@ -834,7 +835,7 @@ class TilePipe:
                 self.A, self.weights, self.out, C=None, tile_count_semaphore=None,
                 tile_M=self.tile_m, tile_N=self.tile_n, cluster_M=1, cluster_N=1,
                 persistent=True, cu_seqlens_m=self.cu_seqlens_m,
-                expert_ready_flags=self.flags if gated else None,
+                tilepipe=TilePipeArgs(expert_ready_flags=self.flags if gated else None),
                 max_active_clusters=max_clusters)
 
     def reset(self):

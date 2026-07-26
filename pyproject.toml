@@ -28,7 +28,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["quack*"]
+include = ["quack*", "tilepipe*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "quack.__version__"}

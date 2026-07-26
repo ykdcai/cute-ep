@@ -33,7 +33,21 @@ from cutlass._mlir.dialects import llvm
 from cutlass._mlir.extras import types as T
 from cutlass.cutlass_dsl import dsl_user_op
 
-from quack.cute_dsl_utils import nanosleep
+@dsl_user_op
+def nanosleep(ns: int | Int32, *, loc=None, ip=None) -> None:
+    """Suspend the calling warp for ~ns nanoseconds (sm_70+ scheduler hint).
+
+    Used in the spin-wait loops below to avoid hammering the memory system
+    with back-to-back polls.
+    """
+    llvm.inline_asm(
+        None,
+        [Int32(ns).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
 
 
 @dsl_user_op

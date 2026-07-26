@@ -20,6 +20,7 @@ from quack.gemm_default_epi import (
     GemmDefaultSm120,
 )
 from quack.rounding import RoundingMode
+from tilepipe.args import TilePipeArgs
 from quack.gemm_tvm_ffi_utils import (
     get_majors,
     get_dtypes,
@@ -184,24 +185,12 @@ def gemm(
     concat_layout: dict | None = None,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
     num_warps: Optional[int] = None,
-    # TilePipe: (l,) int32 token-arrival counters, one per varlen_m batch (expert).
-    # The mainloop waits for expert_ready_flags[b] >= seqlen_m(b) before loading batch b.
-    expert_ready_flags: Optional[Tensor] = None,
-    # TilePipe: cap on persistent clusters so some SMs stay free for a comm kernel.
+    # Cap on persistent clusters, so some SMs stay free for a concurrent comm
+    # kernel. None = fill the device (upstream behaviour).
     max_active_clusters: Optional[int] = None,
-    # TilePipe (GEMM->combine): tile-completion publish. tile_flag_ptrs is an
-    # (world,) int64 tensor of every rank's tile-flag array base address
-    # (symmetric memory); tile_flag_offsets is (l,) int32 with
-    # cumsum(ceil(seqlen_m(b) / tile_M)) exclusive — the epilogue bumps
-    # flag[offsets[b] + m_tile] by 1 on every rank once the work tile's D
-    # stores complete. A row block is ready when its counter reaches
-    # ceil(N / tile_N).
-    tile_flag_ptrs: Optional[Tensor] = None,
-    tile_flag_offsets: Optional[Tensor] = None,
-    # Spacing (in int32 elements) between consecutive tile flags. 1 packs 32
-    # flags into a 128B line; 32 gives each its own line, spreading the release
-    # atomics over more L2 slices. The consumer must index flags[idx * stride].
-    tile_flag_stride: int = 1,
+    # TilePipe expert-ready gating and GEMM->combine tile-flag publish; see
+    # tilepipe/args.py. None = plain GEMM, compiles exactly as upstream.
+    tilepipe: Optional[TilePipeArgs] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -219,12 +208,8 @@ def gemm(
     if varlen_k:
         assert A.stride(-2) == 1, "varlen_k requires A to be m-major"
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
-    if expert_ready_flags is not None:
-        assert varlen_m, "expert_ready_flags requires varlen_m (grouped GEMM)"
-        assert not gather_A, "expert_ready_flags not supported with gather_A"
-    if tile_flag_ptrs is not None:
-        assert varlen_m, "tile_flag_ptrs requires varlen_m (grouped GEMM)"
-        assert tile_flag_offsets is not None, "tile_flag_ptrs requires tile_flag_offsets"
+    tilepipe = tilepipe if tilepipe is not None else TilePipeArgs()
+    tilepipe.validate(varlen_m, gather_A)
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
@@ -287,9 +272,7 @@ def gemm(
         sr_seed_mode,
         trace_ptr is not None,
         num_warps,
-        expert_ready_flags is not None,
-        tile_flag_ptrs.numel() if tile_flag_ptrs is not None else 0,
-        tile_flag_stride,
+        *tilepipe.compile_key,
     )
 
     from quack.cache import is_compile_only
@@ -328,10 +311,7 @@ def gemm(
         tile_count_semaphore,
         batch_idx_permute,
     )
-    varlen_args = make_varlen_args(
-        cu_seqlens_m, cu_seqlens_k, A_idx, expert_ready_flags,
-        tile_flag_ptrs, tile_flag_offsets,
-    )
+    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, tilepipe)
 
     if device_capacity[0] in [10, 11]:
         compiled_fn(

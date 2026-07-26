@@ -14,6 +14,7 @@ import torch
 
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
+from tilepipe.args import TilePipeArgs
 
 
 requires_sm100 = pytest.mark.skipif(
@@ -63,7 +64,7 @@ def test_gemm_varlen_m_tile_flag_publish(n, tile_n):
         A, B, out, C=None, tile_count_semaphore=None,
         tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1,
         persistent=True, cu_seqlens_m=cu_seqlens_m,
-        tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets),
     )
     torch.cuda.synchronize()
 
@@ -115,7 +116,7 @@ def test_gemm_varlen_m_tile_flag_publish_fanout(world):
         A, B, out, C=None, tile_count_semaphore=None,
         tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1,
         persistent=True, cu_seqlens_m=cu_seqlens_m,
-        tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets),
     )
     torch.cuda.synchronize()
 
@@ -153,8 +154,8 @@ def test_gemm_varlen_m_tile_flag_stride(stride):
         A, B, out, C=None, tile_count_semaphore=None,
         tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1,
         persistent=True, cu_seqlens_m=cu_seqlens_m,
-        tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
-        tile_flag_stride=stride,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+                              tile_flag_stride=stride),
     )
     torch.cuda.synchronize()
 
@@ -206,7 +207,7 @@ def test_gemm_varlen_m_tile_flag_cluster_overhang(tile_m, cluster_m, cluster_n):
         A, B, out, C=None, tile_count_semaphore=None,
         tile_M=tile_m, tile_N=tile_n, cluster_M=cluster_m, cluster_N=cluster_n,
         persistent=True, cu_seqlens_m=cu_seqlens_m,
-        tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets),
     )
     torch.cuda.synchronize()
 
@@ -251,8 +252,8 @@ def test_gemm_varlen_m_tile_flags_with_gating():
         A, B, out, C=None, tile_count_semaphore=None,
         tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1,
         persistent=True, cu_seqlens_m=cu_seqlens_m,
-        expert_ready_flags=ready_flags,
-        tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+        tilepipe=TilePipeArgs(expert_ready_flags=ready_flags,
+                              tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets),
     )
     torch.cuda.synchronize()
 
