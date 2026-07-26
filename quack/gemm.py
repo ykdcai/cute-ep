@@ -66,7 +66,8 @@ def _compile_gemm(
     has_trace_ptr,
     num_warps,
     has_ready_flags=False,
-    has_tile_flags=False,
+    tile_flag_world=0,
+    tile_flag_stride=1,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -121,8 +122,11 @@ def _compile_gemm(
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(
         varlen_m, varlen_k, gather_A, aidx_len,
-        has_ready_flags=has_ready_flags, has_tile_flags=has_tile_flags,
+        has_ready_flags=has_ready_flags, tile_flag_world=tile_flag_world,
     )
+    def _post_init(obj):
+        obj.tile_flag_stride = tile_flag_stride
+
     return compile_gemm_kernel(
         GemmCls,
         a_dtype,
@@ -140,6 +144,7 @@ def _compile_gemm(
         epi_args,
         scheduler_args,
         varlen_args,
+        post_init=_post_init if tile_flag_world > 0 else None,
         has_trace_ptr=has_trace_ptr,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
@@ -193,6 +198,10 @@ def gemm(
     # ceil(N / tile_N).
     tile_flag_ptrs: Optional[Tensor] = None,
     tile_flag_offsets: Optional[Tensor] = None,
+    # Spacing (in int32 elements) between consecutive tile flags. 1 packs 32
+    # flags into a 128B line; 32 gives each its own line, spreading the release
+    # atomics over more L2 slices. The consumer must index flags[idx * stride].
+    tile_flag_stride: int = 1,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -279,7 +288,8 @@ def gemm(
         trace_ptr is not None,
         num_warps,
         expert_ready_flags is not None,
-        tile_flag_ptrs is not None,
+        tile_flag_ptrs.numel() if tile_flag_ptrs is not None else 0,
+        tile_flag_stride,
     )
 
     from quack.cache import is_compile_only

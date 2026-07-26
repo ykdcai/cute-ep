@@ -288,7 +288,9 @@ def main():
     parser.add_argument("--experts", type=int, default=16)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--tile-m", type=int, default=128)
-    parser.add_argument("--tile-n", type=int, default=128)
+    parser.add_argument("--tile-n", type=int, default=256,
+                        help="fastest cluster-1x1 config is 128x256; it also "
+                             "halves the tile-flag publishes per row")
     parser.add_argument("--comm-warps", type=int, default=16)
     parser.add_argument("--copy", choices=["simt", "tma"], default="simt",
                         help="dispatch copy engine: warp 256-bit SIMT copies, or "

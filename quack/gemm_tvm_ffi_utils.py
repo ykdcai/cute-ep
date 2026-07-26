@@ -103,8 +103,12 @@ def make_varlen_args(
 
 
 def make_fake_varlen_args(
-    varlen_m, varlen_k, gather_A, aidx_len, has_ready_flags=False, has_tile_flags=False
+    varlen_m, varlen_k, gather_A, aidx_len, has_ready_flags=False, tile_flag_world=0
 ):
+    # tile_flag_world is the number of peer flag arrays (0 = no tile flags). It
+    # is STATIC on purpose: the epilogue's publish loop is per-rank, and a
+    # dynamic extent turns each publish into an unroll ladder over gmem loads.
+    has_tile_flags = tile_flag_world > 0
     if not varlen_m and not varlen_k:
         return None
     num_seqlens = cute.sym_int()
@@ -124,7 +128,7 @@ def make_fake_varlen_args(
             else None
         ),
         mTileFlagPtrs=(
-            fake_tensor(Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
+            fake_tensor(Int64, (tile_flag_world,), leading_dim=0, divisibility=1)
             if has_tile_flags
             else None
         ),

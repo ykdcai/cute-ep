@@ -25,7 +25,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
-from quack.tilepipe_sync import ExpertArrivalSemaphore
+from quack.tilepipe_sync import ExpertArrivalSemaphore, publish_tile_flag
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -186,6 +186,10 @@ class GemmSm100(GemmTmaBase):
         self.concat_layout = concat_layout or ()
         self.use_tma_gather = use_tma_gather
         self.use_pdl = use_pdl
+        # TilePipe: spacing (in int32 elements) between consecutive tile flags.
+        # 1 packs 32 flags per 128B line; 32 gives each flag its own line. Set
+        # via compile_gemm_kernel's post_init hook (see gemm.py).
+        self.tile_flag_stride = 1
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if use_tma_gather:
@@ -1708,20 +1712,70 @@ class GemmSm100(GemmTmaBase):
                 # epi_tile_num. The last pending tile publishes after the
                 # end-of-loop producer_tail. Counters are order-agnostic, so
                 # the one-tile lag only delays readiness by ~one epilogue.
+                # TODO(tilepipe): switch the producer GEMM to 2-CTA MMA.
+                # Measured on B200 at the DSv3 shape (total_m=131072, N=4096,
+                # K=7168, 32 experts, publish fan-out 8):
+                #   128x256 cluster 1x1  5.66 ms  1360 TFLOPS  (what we run)
+                #   256x256 cluster 2x1  5.32 ms  1446 TFLOPS  (+6%)
+                # Deferred until the publish-overhead fix (red/unrolled/no
+                # ladder) is confirmed on the real pipeline and the overlap
+                # runs are shown race-free — cluster > 1 changes the epilogue's
+                # concurrency, so it must not be in flight during that
+                # verification. Two things to do when picking it up:
+                #   1. The flag index space counts CTA tiles, and 2-CTA halves
+                #      the CTA tile M. Every host that builds tile_offsets
+                #      (quack/tilepipe.py build_combine_metadata, plan_combine,
+                #      and the drivers' n_tiles) must use tile_M // 2, not
+                #      tile_M. Getting this wrong is silent: counters simply
+                #      never reach target and the consumer hangs.
+                #   2. The overhang predicate below is already in place and
+                #      verified at c1x1/c2x1/c1x2/c2x2 by
+                #      examples/distributed/tilepipe_gemm_tune.py, which checks
+                #      exact flag counts per config.
                 if const_expr(varlen_params.mTileFlagPtrs is not None):
+                    # The wait_group below is a no-op only while the epilogue's
+                    # own in-flight store groups cannot exceed this tile's
+                    # count; epi_stage grows to fill smem (see
+                    # _compute_stages), so pin the invariant here.
+                    assert self.epi_stage <= epi_tile_num, (
+                        f"TilePipe publish would stall the epilogue: epi_stage="
+                        f"{self.epi_stage} > epi_tile_num={epi_tile_num}"
+                    )
                     if is_tma_warp:
                         cute.arch.cp_async_bulk_wait_group(epi_tile_num)
                         cute.arch.fence_proxy("async")
                         if prev_tile_valid:
                             if cute.arch.lane_idx() == 0:
-                                sem = ExpertArrivalSemaphore(
-                                    peer_ptrs=varlen_params.mTileFlagPtrs
-                                )
-                                sem.arrive_all(prev_flag_idx, Int32(1))
+                                publish_tile_flag(varlen_params.mTileFlagPtrs, prev_flag_idx, Int32(1))
                         prev_flag_idx = (
                             varlen_params.mTileOffsets[batch_idx] + tile_coord_mnkl[0]
+                        ) * self.tile_flag_stride
+                        # Scheduling is per CLUSTER, so a batch whose tile count
+                        # is not a multiple of the cluster gets overhanging CTAs
+                        # with an out-of-range (m, n). Their D stores are
+                        # predicated away, but an unpredicated publish would
+                        # land on the NEXT expert's flags (m overhang) or
+                        # overshoot this row's target (n overhang). Repro:
+                        # 2 experts x 640 rows, cta_tile_m=128 (5 tiles, odd),
+                        # cluster 2x1 -> flag[5] reaches 4 instead of 2.
+                        #
+                        # A 1x1 cluster is exactly one CTA per work tile, so
+                        # there is no overhang and the predicate is a constant
+                        # True. Keep it compile-time so the 1x1 path emits no
+                        # extra compare and no extra cu_seqlens load.
+                        cluster_mn = (
+                            self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1]
                         )
-                        prev_tile_valid = Boolean(True)
+                        if const_expr(cluster_mn == 1):
+                            prev_tile_valid = Boolean(True)
+                        else:
+                            prev_tile_valid = Boolean(
+                                tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                                < varlen_manager.len_m(batch_idx)
+                            ) & Boolean(
+                                tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                                < cute.size(mD_mnl, mode=[1])
+                            )
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1736,10 +1790,7 @@ class GemmSm100(GemmTmaBase):
                     cute.arch.fence_proxy("async")
                     if prev_tile_valid:
                         if cute.arch.lane_idx() == 0:
-                            sem = ExpertArrivalSemaphore(
-                                peer_ptrs=varlen_params.mTileFlagPtrs
-                            )
-                            sem.arrive_all(prev_flag_idx, Int32(1))
+                            publish_tile_flag(varlen_params.mTileFlagPtrs, prev_flag_idx, Int32(1))
 
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()

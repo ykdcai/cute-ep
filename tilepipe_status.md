@@ -87,22 +87,80 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
 
 ## Next steps
 
-1. **Measure time-to-first-ready-tile** (cheap instrumentation). Settles
+0. **Verify the low-overhead publish on the real pipeline** (in flight). The
+   epilogue publish now emits `red.release.sys` (was `atom`, an RMW returning
+   a dead value) over a fully unrolled per-rank loop (the world size is a
+   compile-time constant via `tile_flag_world`; it used to be dynamic, which
+   wrapped every publish in an unroll-by-16/8/4 branch ladder over gmem
+   loads). Single-GPU A/B at 128x256: ~+2% at 16K tokens, at or below
+   run-to-run noise. **Flag padding does not help** — `tile_flag_stride`
+   swept at 1/8/32 moves nothing outside noise, because NVIDIA atomics
+   execute at the L2 slice rather than migrating a line to the SM, so there
+   is no CPU-style ping-pong. What does cost is the *number* of publishes:
+   `tile_n=128` doubles the n-tiles and shows a stubborn +13-18%.
+   Gate before moving on: overlap runs stay race-free.
+1. **Multi-CTA GEMM is deferred, not rejected** (TODO in `gemm_sm100.py`).
+   `256x256 cluster 2x1` measures 5.32 ms / 1446 TFLOPS vs 5.66 ms / 1360
+   for today's `128x256 c1x1` (+6%). Enabling it found a real bug, now
+   fixed: cluster-granular scheduling gives overhanging CTAs an out-of-range
+   (m, n), and the publish was unpredicated, so it landed on the *next*
+   expert's flags. The predicate is compile-time gated to `cluster != 1x1`,
+   so the 1x1 PTX is unchanged. Picking this up also requires every host
+   that builds `tile_offsets` to switch to CTA tile M (`tile_M // 2`).
+   Sweep both with `examples/distributed/tilepipe_gemm_tune.py` (single GPU).
+2. **Publish to all peers with ONE instruction (multimem) — NOT for
+   gemm+combine.** `distributed_gemm_all_reduce_blackwell.py` publishes with
+   `cutlass.utils.distributed.multimem_red_add1(lock_ptr, order="release",
+   scope="gpu")` on a *multicast* flag tensor (`barrier_flag_mc`): one
+   instruction updates every peer's copy, so its cost is O(1) in world size
+   instead of our O(world) loop of `red`s.
+   **But push-combine's gate is rank-LOCAL** — every `launch_gemm` in
+   `tilepipe_gemm_combine.py` passes `local_publish=True`, a 1-entry pointer
+   table — so the fan-out is 1 and multimem has nothing to collapse. It is
+   relevant only to **gemm+allreduce** (where every rank must see the
+   producer's tile) and to the deprecated pull-combine path.
+   Measured consequence of the fan-out: publish overhead at world=1 is
+   +2.5% +-3.5 (128x256) and +3.7% +-5.5 (128x128), ~9-10 ns per publish —
+   both inside their own error bars. The alarming +13-18% previously
+   attributed to publish *count* was mostly the tuner's `--world 8` default,
+   i.e. an 8x fan-out the push path never pays. The tuner now defaults to
+   world=1 to match the pipeline.
+   Also worth knowing: `red_add1`/`multimem_red_add1` already exist upstream
+   and are the same instruction as `quack/tilepipe_sync.py:red_release_sys`,
+   which only earns its place by taking a variable count.
+   Two things NOT to copy from it: it calls `c_pipeline.producer_tail()`
+   per output tile to drain stores before flagging (its own comment notes
+   this differs from the regular epilogue) — that is the ~10% drain we avoid
+   by publishing one tile behind; and it sizes flags per CTA via
+   `linear_idx * cluster_size + block_idx_in_cluster()`, which handles the
+   cluster overhang by giving overhanging CTAs their own harmless slots
+   instead of predicating. Either solution works; ours keeps the flag space
+   equal to the consumer's tile space, which the combine gate needs.
+3. **push-combine transfer redesign — POSTPONED, analysis complete.**
+   See `tilepipe_combine_design.md`. Summary: destination order is free (the
+   reduce can permute), which turns each segment into a contiguous ->
+   contiguous transfer and lets consecutive rows merge into one bulk copy.
+   Full-width 1-D beats 2-D column slices (no tensormaps); SMEM staging — not
+   contiguity — bounds op size, so the realistic gain is 8 KB -> ~32 KB per op
+   plus the per-row index loads leaving the inner loop. Fragmentation by home
+   rank is real but never fatal (worst measured case still beats today's 8 KB).
+   Postponed in favour of prototyping gemm+allreduce.
+4. **Measure time-to-first-ready-tile** (cheap instrumentation). Settles
    whether combine is starved by readiness or by the SM tax. The raster
    heuristic picks `AlongN` for our shape (blocks_m=1024 >> blocks_n=32), so
    rows should complete early and steadily — but this is unverified.
-2. **Verify the SM partition** actually matches `max_active_clusters`, and
+5. **Verify the SM partition** actually matches `max_active_clusters`, and
    sweep the low-C regime (8/12/16) where the model predicts a win.
-3. **`LayoutSemaphore` refactor.** Producer publishes at its natural (m,n)
+6. **`LayoutSemaphore` refactor.** Producer publishes at its natural (m,n)
    tile coordinate (already true); consumers declare their readiness unit as
    a layout, with `target = |fiber of L|`. Retires `n_tiles`-as-an-argument
    and the hand-maintained index spaces that caused three bugs (trickle hang,
    flag_idx mismatch, tail-publish). This is the reuse vehicle for
    **GEMM+allreduce**, whose consumer unit is one (m,n) tile (target 1) and
    which needs *no epilogue change* under this design.
-4. **Pipelined gate**, then re-measure the 12%/6.5% overhead.
-5. Dispatch-side SIMT vs TMA A/B at K=7168 to confirm the default backend.
-6. Fix or retire the `CombineTmaKernel` race (push supersedes it for the
+7. **Pipelined gate**, then re-measure the 12%/6.5% overhead.
+8. Dispatch-side SIMT vs TMA A/B at K=7168 to confirm the default backend.
+9. Fix or retire the `CombineTmaKernel` race (push supersedes it for the
    overlapped role; it remains the serial/standalone combine).
 
 ## Not worth doing (measured or reasoned)
@@ -110,9 +168,26 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
 - **Pushing every 16/32 tokens**: the MMA emits a whole 128-row tile at once,
   so sub-tile M granularity creates no earliness; only `tile_M=32` would, at
   large GEMM cost.
-- **Per-(m,n)-tile pushing in combine**: the destination row is contiguous
-  `[N]`, so a column slice becomes 128 x 256 B strided writes instead of one
-  8 KB row — 32x more transfers where we are already bandwidth-limited. (For
-  allreduce this objection does not apply: source and destination layouts
-  match.)
+- **Per-(m,n)-tile pushing in combine**: OPEN, not settled — the earlier
+  "32x more transfers" claim in this file was wrong. It assumed a SIMT
+  lowering (a column slice becoming 128 strided per-row writes). TMA moves
+  2D tiles natively, and no accumulation is involved, so the honest
+  arithmetic is: per m-tile today we issue 128 one-dimensional
+  `cp.async.bulk` row copies of 8 KB (= 1 MB); tile-granular with SM100
+  `cp.async.bulk.tensor.2d.tile::scatter4` would be 16 n-tiles x 32
+  scatter4 ops of 4 x 512 B (= the same 1 MB) — **4x more ops, each 4x
+  smaller**, not 32x.
+  The real blocker is different: the 128 rows of a GEMM m-tile go to 128
+  arbitrary token slots (`slot = tok * topk + j`) on possibly different
+  ranks, so the destination is a scatter, not an affine 2D tile. That needs
+  scatter4 plus a tensormap per destination rank (see
+  `quack/tensormap_manager.py`); rows are already sorted by (expert, home),
+  so each scatter4's 4 rows do share a destination rank.
+  Whether it pays depends entirely on **earliness**, which is unmeasured:
+  the raster heuristic picks `AlongN`, so all `n_tiles` of an m-tile
+  complete back to back and the wait for a whole row block may already be
+  short. Settle with the time-to-first-ready-tile instrumentation before
+  building it. (For allreduce none of this arises: source and destination
+  layouts match, so a per-(m,n) gate with target 1 is both finer and
+  contiguous.)
 - **Per-token-block arrival counters**: buys <=0.15 ms, behind a 2 ms problem.

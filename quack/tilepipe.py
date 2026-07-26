@@ -632,7 +632,12 @@ class TilePipe:
         topk_indices,        # [tokens, topk] int32 cuda tensor (global expert ids)
         num_experts,
         tile_m=128,
-        tile_n=128,
+        # 128x256 is the fastest cluster-1x1 config measured by
+        # examples/distributed/tilepipe_gemm_tune.py at the DSv3 shape
+        # (5.66 ms / 1360 TFLOPS vs 7.60 ms / 1012 at 128x128). It also halves
+        # the number of tile-flag publishes per row, which drops the publish
+        # overhead from ~+15% to ~+2%.
+        tile_n=256,
         comm_warps=16,
         publish="segment",   # "segment" or "token" flag granularity
         copy_engine="simt",  # "simt" (warp 256-bit copies) or "tma" (bulk async)

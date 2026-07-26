@@ -508,7 +508,7 @@ def main():
     parser = argparse.ArgumentParser(description="TilePipe GEMM -> gated combine")
     parser.add_argument("--tokens", type=int, default=None,
                         help="single token count (overrides --token-sweep)")
-    parser.add_argument("--token-sweep", type=str, default="2048,4096,8192,16384",
+    parser.add_argument("--token-sweep", type=str, default="2048,4096,8192,16384,32768",
                         help="comma-separated tokens/rank to sweep")
     parser.add_argument("--results-dir", type=str, default="bench_results",
                         help="parent dir for the timestamped run directory")
@@ -518,7 +518,9 @@ def main():
                         help="default: 32 * world_size")
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--tile-m", type=int, default=128)
-    parser.add_argument("--tile-n", type=int, default=128)
+    parser.add_argument("--tile-n", type=int, default=256,
+                        help="fastest cluster-1x1 config is 128x256; it also "
+                             "halves the tile-flag publishes per row")
     parser.add_argument("--hchunk", type=int, default=2048,
                         help="combine bulk tile elems (must divide gemm-n)")
     parser.add_argument("--combine-stages", type=int, default=8)

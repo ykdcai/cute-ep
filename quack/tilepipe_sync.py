@@ -66,6 +66,61 @@ def ld_acquire_sys(ptr, *, loc=None, ip=None) -> Int32:
     )
 
 
+@dsl_user_op
+def red_release_sys(ptr, val: Int32, *, loc=None, ip=None) -> None:
+    """`red.release.sys.global.add.u32` — fire-and-forget release add.
+
+    `cute.arch.atomic_add` returns the old value, so it lowers to `atom`, which
+    allocates a destination register and (on the producer's critical path) is a
+    round-trip the warp can be made to wait on even when the result is dead.
+    `red` has no destination: the store unit takes it and the warp moves on.
+    This is the GEMM epilogue's publish, issued once per work tile per rank, so
+    it sits directly on the producer's critical path.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.release.sys.global.add.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+def publish_tile_flag(peer_ptrs: cute.Tensor, e: Int32, count: Int32) -> None:
+    """Broadcast `count` onto flag[e] on every rank — the GEMM epilogue's
+    per-work-tile publish, on the producer's critical path.
+
+    Two things make this cheaper than `ExpertArrivalSemaphore.arrive_all`:
+
+    1. **Static width.** `peer_ptrs` must have a compile-time extent (see
+       `tile_flag_world` in gemm.py), so the per-rank loop is a Python loop
+       that unrolls fully. With a dynamic extent the DSL emits an
+       unroll-by-16/8/4 branch ladder around every publish.
+    2. **`red`, not `atom`.** No destination register, nothing for the warp
+       to wait on.
+
+    The `peer_ptrs[r]` loads are loop-invariant with r constant, so LICM
+    hoists them out of the caller's tile loop; keeping this a plain function
+    (rather than an object holding the bases) avoids making them loop-carried
+    values the DSL would have to flatten across the `while`.
+    """
+    world = cute.size(peer_ptrs.shape)
+    assert isinstance(world, int), (
+        "publish_tile_flag needs a static peer-pointer extent; pass the world "
+        "size through the compile key (see gemm.py tile_flag_world)"
+    )
+    for r in range(world):
+        ptr = cute.make_ptr(Int32, peer_ptrs[r], cute.AddressSpace.gmem, assumed_align=4)
+        red_release_sys(ptr + e, count)
+
+
 @dataclass
 class ExpertArrivalSemaphore:
     """flag[e] counts arrivals; expert e is ready when flag[e] >= target.
