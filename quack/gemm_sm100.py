@@ -25,7 +25,7 @@ from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
-from tilepipe.sync import ExpertArrivalSemaphore, publish_tile_flag
+from tilepipe.sync import ExpertArrivalSemaphore, TileFlagPipeline
 from quack.tile_scheduler import TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
@@ -186,10 +186,12 @@ class GemmSm100(GemmTmaBase):
         self.concat_layout = concat_layout or ()
         self.use_tma_gather = use_tma_gather
         self.use_pdl = use_pdl
-        # TilePipe: spacing (in int32 elements) between consecutive tile flags.
-        # 1 packs 32 flags per 128B line; 32 gives each flag its own line. Set
-        # via compile_gemm_kernel's post_init hook (see gemm.py).
-        self.tile_flag_stride = 1
+        # TilePipe: which consumer atom the epilogue's tile-completion publish
+        # is for — a TileSemaphore subclass owning the flag index rule and the
+        # publish instruction (see tilepipe/sync.py). The same object is handed
+        # to the consumer kernel. Set via compile_gemm_kernel's post_init hook
+        # (see gemm.py); None whenever mTileFlagPtrs is None.
+        self.tile_semaphore = None
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if use_tma_gather:
@@ -1623,6 +1625,20 @@ class GemmSm100(GemmTmaBase):
             # not yet proven complete (published one work tile behind).
             prev_flag_idx = Int32(0)
             prev_tile_valid = Boolean(False)
+            # n-tile count, needed only by semaphores whose atom is finer than
+            # a row block (OutputTileSemaphore). Loop-invariant; hoisted.
+            n_tile_count = None
+            tile_flags = None
+            if const_expr(varlen_params.mTileFlagPtrs is not None):
+                assert has_D, "TilePipe tile-flag publish requires a D output"
+                assert self.tile_semaphore is not None, (
+                    "tile_flag_ptrs given but no tile_semaphore reached the kernel "
+                    "(see gemm.py post_init / TilePipeArgs.semaphore)"
+                )
+                n_tile_count = cute.ceil_div(
+                    cute.size(mD_mnl, mode=[1]), self.cta_tile_shape_mnk[1]
+                )
+                tile_flags = TileFlagPipeline(self.tile_semaphore)
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
@@ -1701,17 +1717,11 @@ class GemmSm100(GemmTmaBase):
                 acc_consumer_state.advance()
                 tctx.e("epilogue")
 
-                # TilePipe (GEMM->combine): DEFERRED tile-completion publish.
-                # The D stores are async-proxy (TMA) writes tracked in this
-                # thread's bulk groups, so publishing THIS tile would need a
-                # full drain (producer_tail per tile costs ~10% GEMM by
-                # killing the store/mainloop overlap). Instead publish the
-                # PREVIOUS work tile: waiting until pending groups <= this
-                # tile's own group count (epi_tile_num) proves everything
-                # older is complete — a no-op whenever epi_stage <=
-                # epi_tile_num. The last pending tile publishes after the
-                # end-of-loop producer_tail. Counters are order-agnostic, so
-                # the one-tile lag only delays readiness by ~one epilogue.
+                # TilePipe: DEFERRED tile-completion publish. Which flag it
+                # bumps is the semaphore's business (row block for combine,
+                # (m,n) tile for allreduce); the deferral below is common to
+                # both. Rationale for publishing one tile behind rather than
+                # draining: see publish_prev_and_arm in tilepipe/sync.py.
                 # TODO(tilepipe): switch the producer GEMM to 2-CTA MMA.
                 # Measured on B200 at the DSv3 shape (total_m=131072, N=4096,
                 # K=7168, 32 experts, publish fan-out 8):
@@ -1733,23 +1743,16 @@ class GemmSm100(GemmTmaBase):
                 #      tilepipe/gemm_tune.py, which checks
                 #      exact flag counts per config.
                 if const_expr(varlen_params.mTileFlagPtrs is not None):
-                    # The wait_group below is a no-op only while the epilogue's
-                    # own in-flight store groups cannot exceed this tile's
-                    # count; epi_stage grows to fill smem (see
-                    # _compute_stages), so pin the invariant here.
+                    # commit()'s bulk-group wait is free only while the
+                    # epilogue's own in-flight store groups cannot exceed this
+                    # tile's count; epi_stage grows to fill smem (see
+                    # _compute_stages), so pin the invariant here, where both
+                    # numbers are in scope.
                     assert self.epi_stage <= epi_tile_num, (
                         f"TilePipe publish would stall the epilogue: epi_stage="
                         f"{self.epi_stage} > epi_tile_num={epi_tile_num}"
                     )
                     if is_tma_warp:
-                        cute.arch.cp_async_bulk_wait_group(epi_tile_num)
-                        cute.arch.fence_proxy("async")
-                        if prev_tile_valid:
-                            if cute.arch.lane_idx() == 0:
-                                publish_tile_flag(varlen_params.mTileFlagPtrs, prev_flag_idx, Int32(1))
-                        prev_flag_idx = (
-                            varlen_params.mTileOffsets[batch_idx] + tile_coord_mnkl[0]
-                        ) * self.tile_flag_stride
                         # Scheduling is per CLUSTER, so a batch whose tile count
                         # is not a multiple of the cluster gets overhanging CTAs
                         # with an out-of-range (m, n). Their D stores are
@@ -1767,15 +1770,27 @@ class GemmSm100(GemmTmaBase):
                             self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1]
                         )
                         if const_expr(cluster_mn == 1):
-                            prev_tile_valid = Boolean(True)
+                            tile_valid = Boolean(True)
                         else:
-                            prev_tile_valid = Boolean(
+                            tile_valid = Boolean(
                                 tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
                                 < varlen_manager.len_m(batch_idx)
                             ) & Boolean(
                                 tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
                                 < cute.size(mD_mnl, mode=[1])
                             )
+                        prev_flag_idx, prev_tile_valid = tile_flags.commit(
+                            prev_flag_idx,
+                            prev_tile_valid,
+                            varlen_params.mTileFlagPtrs,
+                            varlen_params.mTileOffsets,
+                            batch_idx,
+                            tile_coord_mnkl[0],
+                            tile_coord_mnkl[1],
+                            n_tile_count,
+                            tile_valid,
+                            epi_tile_num,
+                        )
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
@@ -1787,10 +1802,9 @@ class GemmSm100(GemmTmaBase):
             # TilePipe: the last deferred tile is provably complete now.
             if const_expr(varlen_params.mTileFlagPtrs is not None):
                 if is_tma_warp:
-                    cute.arch.fence_proxy("async")
-                    if prev_tile_valid:
-                        if cute.arch.lane_idx() == 0:
-                            publish_tile_flag(varlen_params.mTileFlagPtrs, prev_flag_idx, Int32(1))
+                    tile_flags.tail(
+                        prev_flag_idx, prev_tile_valid, varlen_params.mTileFlagPtrs
+                    )
 
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()

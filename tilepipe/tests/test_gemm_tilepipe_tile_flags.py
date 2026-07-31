@@ -15,6 +15,7 @@ import torch
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
 from tilepipe.args import TilePipeArgs
+from tilepipe.sync import OutputTileSemaphore, RowBlockSemaphore
 
 
 requires_sm100 = pytest.mark.skipif(
@@ -155,7 +156,7 @@ def test_gemm_varlen_m_tile_flag_stride(stride):
         tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1,
         persistent=True, cu_seqlens_m=cu_seqlens_m,
         tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
-                              tile_flag_stride=stride),
+                              tile_semaphore=RowBlockSemaphore(stride=stride)),
     )
     torch.cuda.synchronize()
 
@@ -260,6 +261,165 @@ def test_gemm_varlen_m_tile_flags_with_gating():
     n_tiles = (n + tile_n - 1) // tile_n
     assert torch.equal(
         tile_flags.cpu(), torch.full((total_tiles,), n_tiles, dtype=torch.int32)
+    )
+    ref = _reference(A, B, cu_seqlens_m)
+    assert torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# OutputTileSemaphore: one flag per (batch, m_tile, n_tile).
+# ---------------------------------------------------------------------------
+# The GEMM->allreduce atom. Same producer, same publish site, same deferral as
+# the row-block case above — only the flag index rule differs, so these tests
+# are about the index space and nothing else.
+#
+# Scope note: at world = 1 every flag lands on 1, which pins the per-batch
+# offset stride (m_tiles * n_tiles, NOT m_tiles), the absence of collisions,
+# and the overhang predicate. It cannot distinguish m-major from n-major
+# within a batch — both are bijections onto the same range. That ambiguity is
+# only observable by a consumer mapping flag -> tile, so it is pinned by the
+# 2-GPU allreduce correctness test, where a transposed index reduces a tile
+# whose data has not arrived.
+#
+# multicast=False throughout: `multimem.red` needs a multicast address from
+# nvshmem, which a single-GPU test has no business allocating. The index
+# arithmetic under test is shared by both publish instructions.
+
+
+def _tile_flag_metadata_2d(seq_lens, cta_tile_m, n_tiles, device):
+    """Flag space for OutputTileSemaphore: each batch owns
+    ceil(len_m / tile_M) * n_tiles slots, so the per-batch base is the
+    exclusive cumsum of THAT, not of the m-tile count."""
+    m_tiles = [(int(s) + cta_tile_m - 1) // cta_tile_m for s in seq_lens.tolist()]
+    per_batch = [t * n_tiles for t in m_tiles]
+    offsets = torch.tensor(
+        [0] + list(torch.tensor(per_batch).cumsum(0)), dtype=torch.int32, device=device
+    )[:-1].contiguous()
+    return offsets, sum(per_batch)
+
+
+@requires_sm100
+@pytest.mark.parametrize("tile_n", [128, 256])
+@pytest.mark.parametrize("n", [768, 2048])
+def test_gemm_varlen_m_output_tile_flag_publish(n, tile_n):
+    """Every (m_tile, n_tile) of every expert gets its own counter, bumped
+    exactly once."""
+    if tile_n > n:
+        pytest.skip("tile larger than problem")
+    device = "cuda"
+    torch.random.manual_seed(0)
+    num_experts, tile_m, k = 8, 128, 512
+    n_tiles = (n + tile_n - 1) // tile_n
+    seq_lens = torch.randint(64, 512, (num_experts,), device=device, dtype=torch.int32)
+    total_m = int(seq_lens.sum().item())
+    cu_seqlens_m = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    A = torch.randn((total_m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    B = torch.randn((num_experts, n, k), device=device, dtype=torch.bfloat16)
+    out = torch.empty((total_m, n), device=device, dtype=torch.bfloat16)
+
+    offsets, total_flags = _tile_flag_metadata_2d(seq_lens, tile_m, n_tiles, device)
+    flags = torch.zeros(total_flags, dtype=torch.int32, device=device)
+    flag_ptrs = torch.tensor([flags.data_ptr()], dtype=torch.int64, device=device)
+
+    quack_gemm(
+        A, B, out, C=None, tile_count_semaphore=None,
+        tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1,
+        persistent=True, cu_seqlens_m=cu_seqlens_m,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+                              tile_semaphore=OutputTileSemaphore(multicast=False)),
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.ones(total_flags, dtype=torch.int32)
+    assert torch.equal(flags.cpu(), expected), (
+        f"output-tile flags != 1 everywhere; got "
+        f"{flags.cpu().tolist()[:16]}... (total {total_flags})"
+    )
+    ref = _reference(A, B, cu_seqlens_m)
+    assert torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize("n,tile_n", [(512, 128), (768, 256)])
+def test_gemm_dense_output_tile_flag_publish(n, tile_n):
+    """The publish lives in the epilogue's shared tile loop, so it works
+    without varlen_m — which is the shape GEMM->allreduce actually runs
+    (a TP GEMM, one batch). tile_flag_offsets degenerates to a single zero."""
+    device = "cuda"
+    torch.random.manual_seed(5)
+    m, k, tile_m = 1024, 512, 128
+    m_tiles, n_tiles = (m + tile_m - 1) // tile_m, (n + tile_n - 1) // tile_n
+    A = torch.randn((1, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    B = torch.randn((1, n, k), device=device, dtype=torch.bfloat16)
+    out = torch.empty((1, m, n), device=device, dtype=torch.bfloat16)
+
+    offsets = torch.zeros(1, dtype=torch.int32, device=device)
+    flags = torch.zeros(m_tiles * n_tiles, dtype=torch.int32, device=device)
+    flag_ptrs = torch.tensor([flags.data_ptr()], dtype=torch.int64, device=device)
+
+    quack_gemm(
+        A, B, out, C=None, tile_count_semaphore=None,
+        tile_M=tile_m, tile_N=tile_n, cluster_M=1, cluster_N=1, persistent=True,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+                              tile_semaphore=OutputTileSemaphore(multicast=False)),
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.ones(m_tiles * n_tiles, dtype=torch.int32)
+    assert torch.equal(flags.cpu(), expected), f"dense: {flags.cpu().tolist()}"
+    ref = torch.bmm(A.float(), B.float().mT).to(torch.bfloat16)
+    assert torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "tile_m,cluster_m,cluster_n", [(128, 1, 1), (256, 2, 1), (128, 1, 2), (256, 2, 2)]
+)
+def test_gemm_output_tile_flag_cluster_overhang(tile_m, cluster_m, cluster_n):
+    """Cluster overhang is MORE dangerous for a per-(m,n) flag than for a row
+    block. With a row-block counter an n-overhang merely overshoots the same
+    counter; here it lands on a DIFFERENT tile's counter, leaving one flag at
+    2 and its neighbour at 0 — a consumer would then reduce a tile whose data
+    was never written. n=384 with tile_n=128 gives 3 n-tiles (odd, so
+    cluster_n=2 overhangs) and every seq_len is an odd number of CTA tiles."""
+    device = "cuda"
+    torch.random.manual_seed(6)
+    tile_n, k, n = 128, 256, 384
+    n_tiles = (n + tile_n - 1) // tile_n
+    cta_tile_m = tile_m // 2 if (cluster_m % 2 == 0 and tile_m in (128, 256)) else tile_m
+    seq_lens = torch.tensor(
+        [5 * cta_tile_m, 3 * cta_tile_m, 7 * cta_tile_m, 5 * cta_tile_m],
+        device=device, dtype=torch.int32,
+    )
+    num_experts = seq_lens.numel()
+    total_m = int(seq_lens.sum().item())
+    cu_seqlens_m = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), seq_lens.cumsum(0).to(torch.int32)]
+    )
+    A = torch.randn((total_m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    B = torch.randn((num_experts, n, k), device=device, dtype=torch.bfloat16)
+    out = torch.empty((total_m, n), device=device, dtype=torch.bfloat16)
+
+    offsets, total_flags = _tile_flag_metadata_2d(seq_lens, cta_tile_m, n_tiles, device)
+    flags = torch.zeros(total_flags, dtype=torch.int32, device=device)
+    flag_ptrs = torch.tensor([flags.data_ptr()], dtype=torch.int64, device=device)
+
+    quack_gemm(
+        A, B, out, C=None, tile_count_semaphore=None,
+        tile_M=tile_m, tile_N=tile_n, cluster_M=cluster_m, cluster_N=cluster_n,
+        persistent=True, cu_seqlens_m=cu_seqlens_m,
+        tilepipe=TilePipeArgs(tile_flag_ptrs=flag_ptrs, tile_flag_offsets=offsets,
+                              tile_semaphore=OutputTileSemaphore(multicast=False)),
+    )
+    torch.cuda.synchronize()
+
+    got = flags.cpu()
+    expected = torch.ones(total_flags, dtype=torch.int32)
+    assert torch.equal(got, expected), (
+        f"cluster {cluster_m}x{cluster_n} (cta_tile_m={cta_tile_m}, "
+        f"n_tiles={n_tiles}): overhang leaked, {got.tolist()}"
     )
     ref = _reference(A, B, cu_seqlens_m)
     assert torch.allclose(out.float(), ref.float(), atol=1e-2, rtol=1e-2)

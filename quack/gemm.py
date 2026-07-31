@@ -68,7 +68,7 @@ def _compile_gemm(
     num_warps,
     has_ready_flags=False,
     tile_flag_world=0,
-    tile_flag_stride=1,
+    tile_semaphore=None,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -126,7 +126,7 @@ def _compile_gemm(
         has_ready_flags=has_ready_flags, tile_flag_world=tile_flag_world,
     )
     def _post_init(obj):
-        obj.tile_flag_stride = tile_flag_stride
+        obj.tile_semaphore = tile_semaphore
 
     return compile_gemm_kernel(
         GemmCls,

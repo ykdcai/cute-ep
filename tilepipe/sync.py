@@ -28,7 +28,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
+import cutlass.utils as cute_utils
+from cutlass import Boolean, Int32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.extras import types as T
 from cutlass.cutlass_dsl import dsl_user_op
@@ -277,102 +278,253 @@ def wait_flag(flags: cute.Tensor, idx: Int32, target: Int32, stream: cuda.CUstre
 
 
 # ---------------------------------------------------------------------------
-# LayoutSemaphore: readiness for GEMM-produced tiles.
+# TileSemaphore: the GEMM output-tile readiness protocol, shared by BOTH sides.
 # ---------------------------------------------------------------------------
 # Scope: consumers of a GEMM's output tiles (GEMM->combine, GEMM->allreduce).
 # Dispatch keeps ExpertArrivalSemaphore — its producer unit is a token, not a
 # tile, and its target is ragged (split_sizes).
 #
-# The producer publishes at its NATURAL coordinate — the epilogue's
-# (batch, m_tile) — and never changes. A consumer declares the unit it waits
-# on; the semaphore derives both the flag index (via an indexer) and the
-# target (the number of producer tiles covering one consumer unit, i.e. the
-# fiber size). `n_tiles`/`W` stop being kernel arguments: they are properties
-# of the two tilings, so a consumer cannot disagree with the producer about
-# either the index space or the count. That divergence is what produced the
-# trickle hang, the flag_idx mismatch and the tail-publish bug.
+# The GEMM epilogue publishes at its NATURAL coordinate, (batch, m_tile,
+# n_tile), and never changes. A subclass declares the CONSUMER's atom, which
+# fixes three things at once:
 #
-#   case        producer unit         consumer unit            fiber (target)
-#   combine     (m_tile, n_tile)      (m_tile, all N)          ceil(N/tile_N)
-#   allreduce   (m,n) tile on 1 rank  same tile across W ranks W
+#   * `index()`  — where in the flag array that atom's counter lives,
+#   * `target()` — how many producer publishes complete it (the fiber size),
+#   * `arrive()` — which instruction the publish uses.
 #
-# Fan-out vs fan-in: with one flag per consumer unit the wait is a single
-# poll and the publish fans out to every consumer unit a producer tile
-# touches; with one flag per producer unit the publish is single and the wait
-# fans in. Both cases above have fan-out 1 on the local flag array (combine:
-# a tile maps to exactly one m-tile counter; allreduce: one counter per
-# output tile, incremented once per rank), so the counter form is optimal for
-# both — assert that when adding a third case.
+# `n_tiles`/`W` stop being kernel arguments: they are properties of the two
+# tilings, so a consumer cannot disagree with the producer about the index
+# space or the count. That divergence is what produced the trickle hang, the
+# flag_idx mismatch and the tail-publish bug. One object is handed to the GEMM
+# (via TilePipeArgs) and to the comm kernel, so they cannot drift.
+#
+#   subclass              consumer atom              fiber (target)
+#   RowBlockSemaphore     (batch, m_tile), all N     ceil(N / tile_N)
+#   OutputTileSemaphore   one (m,n) tile, all ranks  world_size
+#
+# Both have fan-out 1 on a given flag array (combine: a work tile maps to
+# exactly one row-block counter; allreduce: one counter per output tile, +1
+# per rank), so the counter form is optimal for both — assert that when
+# adding a third case.
+#
+# LAYERING. TileSemaphore is the PROTOCOL and is architecture-neutral: index
+# arithmetic plus `ld.acquire.sys` / `red.release.sys`, all sm70+. It is the
+# object the producer and the consumer share, and it must stay free of any
+# epilogue or SM-generation detail so a Hopper producer, a Blackwell producer
+# and a plain SIMT comm kernel can all speak it. The one hardware assumption
+# is optional and behind a flag: OutputTileSemaphore(multicast=True) needs an
+# NVLink Switch fabric for `multimem.red`, and multicast=False is the portable
+# fallback.
+#
+# The SM-specific half lives in TileFlagPipeline below, which knows how a
+# particular epilogue proves its stores are visible. Keep new arch knowledge
+# there, not here.
 
 
-@dataclass
-class AffineIndexer:
-    """flag = m_tile * stride + base. For regular (non-varlen) tilings."""
+@dataclass(frozen=True)
+class TileSemaphore:
+    """Base: the parts that do not vary with the consumer's atom.
 
-    stride: int = 1
-    base: int = 0
+    Frozen and field-free apart from `stride` so it is hashable — the object
+    goes straight into the GEMM compile-cache key (see TilePipeArgs).
 
-    @cute.jit
-    def index(self, batch: Int32, m_tile: Int32) -> Int32:
-        return m_tile * Int32(self.stride) + Int32(self.base)
-
-
-@dataclass
-class RaggedTileIndexer:
-    """flag = tile_offsets[batch] + m_tile — per-batch m-tile bases, i.e. the
-    varlen grouped GEMM's tiling (each expert tiled separately)."""
-
-    tile_offsets: cute.Tensor  # [num_batches] int32, exclusive cumsum
-
-    @cute.jit
-    def index(self, batch: Int32, m_tile: Int32) -> Int32:
-        return self.tile_offsets[batch] + m_tile
-
-
-@dataclass
-class LayoutSemaphore:
-    """Counting semaphore over GEMM output tiles.
-
-    flags:     local view of the counter array (consumers)
-    peer_ptrs: [world] int64 symmetric bases (producers); a 1-entry table
-               means "publish locally only" (push-combine).
-    indexer:   (batch, m_tile) -> flag index, shared by BOTH sides.
-    target:    fiber size — how many producer tiles cover one consumer unit.
-               Compile-time for both supported cases.
+    stride: spacing in int32 elements between consecutive flags. 1 packs 32
+    per 128B line. Measured to be noise on B200 (atomics execute at the L2
+    slice, so there is no line ping-pong), kept as a knob for other targets.
     """
 
-    indexer: object
-    target: cutlass.Constexpr
-    flags: Optional[cute.Tensor] = None
-    peer_ptrs: Optional[cute.Tensor] = None
+    stride: int = 1
+
+    # -- subclass contract ---------------------------------------------------
 
     @cute.jit
-    def arrive(self, batch: Int32, m_tile: Int32):
-        """Producer: +1 on this tile's counter, on every rank in peer_ptrs.
-        Caller must have ordered its data writes first (async-proxy stores
-        need cp.async.bulk drain + fence.proxy.async — see the GEMM
-        epilogue)."""
-        idx = self.indexer.index(batch, m_tile)
-        num_ranks = cute.size(self.peer_ptrs.shape)
-        for r in cutlass.range(num_ranks):
-            flag_ptr = cute.make_ptr(
-                Int32, self.peer_ptrs[r], cute.AddressSpace.gmem, assumed_align=4
-            )
-            cute.arch.atomic_add(flag_ptr + idx, Int32(1), sem="release", scope="sys")
+    def index(self, offsets, batch: Int32, m_tile: Int32, n_tile: Int32, n_tiles) -> Int32:
+        """Flag index for the consumer atom containing producer tile
+        (batch, m_tile, n_tile). `offsets` is the per-batch exclusive cumsum
+        of flag counts (None => single batch based at 0)."""
+        raise NotImplementedError
+
+    def target(self, n_tiles: int, world: int) -> int:
+        """Producer publishes needed to complete one consumer atom."""
+        raise NotImplementedError
 
     @cute.jit
-    def poll(self, batch: Int32, m_tile: Int32):
-        """Single-thread: wait until this consumer unit's fiber is complete."""
-        ptr = self.flags.iterator + self.indexer.index(batch, m_tile)
+    def arrive(self, peer_ptrs: cute.Tensor, idx: Int32) -> None:
+        """Producer publish: +1 on flag[idx]. The caller must have ordered its
+        data writes first — async-proxy (TMA) stores need a cp.async.bulk
+        drain plus fence.proxy.async; see the GEMM epilogue."""
+        raise NotImplementedError
+
+    # -- consumer side (identical for every atom) ---------------------------
+
+    @cute.jit
+    def poll(self, flags: cute.Tensor, idx: Int32, target: Int32):
+        """Single-thread: acquire-poll flag[idx] until it reaches target."""
+        ptr = flags.iterator + idx
         arrived = ld_acquire_sys(ptr)
-        while arrived < Int32(self.target):
+        while arrived < target:
             nanosleep(256)
             arrived = ld_acquire_sys(ptr)
 
     @cute.jit
-    def wait_warp(self, batch: Int32, m_tile: Int32):
+    def wait_warp(self, flags: cute.Tensor, idx: Int32, target: Int32):
         """Warp-collective wait (see ExpertArrivalSemaphore.wait_warp)."""
         with cute.arch.elect_one():
-            self.poll(batch, m_tile)
+            self.poll(flags, idx, target)
         cute.arch.sync_warp()
         cute.arch.fence_proxy("async")
+
+
+@dataclass(frozen=True)
+class RowBlockSemaphore(TileSemaphore):
+    """GEMM -> combine. One counter per (batch, m_tile) row block; every
+    n-tile of that row bumps it, so the consumer waits for ceil(N / tile_N).
+
+    The combine consumer needs a whole row (all N) of a token before it can
+    move it, so a finer counter would buy nothing — see status.md
+    "Not worth doing / Per-(m,n)-tile pushing in combine".
+    """
+
+    @cute.jit
+    def index(self, offsets, batch: Int32, m_tile: Int32, n_tile: Int32, n_tiles) -> Int32:
+        return (offsets[batch] + m_tile) * Int32(self.stride)
+
+    def target(self, n_tiles: int, world: int) -> int:
+        return n_tiles
+
+    @cute.jit
+    def arrive(self, peer_ptrs: cute.Tensor, idx: Int32) -> None:
+        publish_tile_flag(peer_ptrs, idx, Int32(1))
+
+
+@dataclass(frozen=True)
+class OutputTileSemaphore(TileSemaphore):
+    """GEMM -> allreduce. One counter per (batch, m_tile, n_tile) output tile,
+    bumped once by each rank, so the consumer waits for `world`.
+
+    Source and destination layouts match here, so a per-(m,n) atom is both
+    finer than the row block AND contiguous — the reason allreduce gets the
+    1:1 producer-atom/consumer-atom mapping that combine cannot.
+
+    multicast=True publishes with ONE `multimem.red` on a multicast flag
+    address (peer_ptrs is then a 1-entry table holding that address), so the
+    cost is O(1) in world size instead of the O(world) loop of `red`s. This is
+    the case where multimem earns its place: push-combine's publish is
+    rank-local (fan-out 1) and has nothing to collapse, but every rank must
+    see an allreduce producer's tile.
+    """
+
+    multicast: bool = True
+
+    @cute.jit
+    def index(self, offsets, batch: Int32, m_tile: Int32, n_tile: Int32, n_tiles) -> Int32:
+        return (offsets[batch] + m_tile * n_tiles + n_tile) * Int32(self.stride)
+
+    def target(self, n_tiles: int, world: int) -> int:
+        return world
+
+    @cute.jit
+    def arrive(self, peer_ptrs: cute.Tensor, idx: Int32) -> None:
+        if const_expr(self.multicast):
+            mc = cute.make_ptr(
+                Int32, peer_ptrs[0], cute.AddressSpace.gmem, assumed_align=4
+            )
+            cute_utils.distributed.multimem_red_add1(mc + idx, scope="sys", order="release")
+        else:
+            publish_tile_flag(peer_ptrs, idx, Int32(1))
+
+
+# ---------------------------------------------------------------------------
+# TileFlagPipeline: the GEMM epilogue's half of the protocol.
+# ---------------------------------------------------------------------------
+# This is the arch-aware layer — it assumes a TMA-store epilogue whose D
+# stores retire in cp.async.bulk commit-groups (SM90 and SM100 both). Porting
+# to an epilogue with a different store-completion rule means changing THIS
+# class only; TileSemaphore above is untouched, and consumers cannot tell.
+
+
+@dataclass(frozen=True)
+class TileFlagPipeline:
+    """A one-deep publish pipeline over the epilogue's work tiles: `commit`
+    once per tile, `tail` once after the loop.
+
+    The names deliberately mirror the CUTLASS store pipeline on the adjacent
+    lines of the epilogue (`epi_store_pipeline.producer_commit/producer_tail`),
+    because this IS that pattern — a producer whose completions are proven
+    asynchronously and therefore observed a fixed distance behind.
+
+    WHY ONE-DEEP (the whole reason this class exists). D stores leave through
+    the async proxy as TMA writes retired in bulk-commit-groups. Proving THIS
+    tile's stores landed needs `cp.async.bulk.wait_group 0`, i.e. a full drain
+    of the store pipeline every tile — that is what the fused CUTLASS
+    allreduce example does, and it costs ~10% of the GEMM by destroying
+    store/mainloop overlap. Waiting on `in_flight` groups instead is free (a
+    no-op while epi_stage <= in_flight) but proves only that everything OLDER
+    than the current tile has landed. So `commit` publishes the previous tile
+    and holds the current one; `tail` releases the last one after the
+    epilogue's own `producer_tail`.
+
+    Callers therefore never see the bulk-group wait, the proxy fence, or the
+    off-by-one: they say "tile (b, m, n) is issued" and "no more tiles".
+
+    The (idx, valid) pair is threaded through the caller rather than stored on
+    this object: it is loop-carried across the epilogue's DSL `while`, and
+    loop-carried values must be explicit. Keeping the index expression in ONE
+    place is the point — `commit` and `tail` disagreeing about it is the
+    tail-publish bug (see the case table above).
+
+    Usage, from the TMA warp only:
+
+        pipe = TileFlagPipeline(sem)
+        idx, valid = Int32(0), Boolean(False)
+        while work_tile.is_valid_tile:
+            ...
+            idx, valid = pipe.commit(idx, valid, ptrs, offsets, b, m, n,
+                                     n_tiles, this_tile_valid, epi_tile_num)
+        epi_store_pipeline.producer_tail()
+        pipe.tail(idx, valid, ptrs)
+    """
+
+    sem: TileSemaphore
+
+    @cute.jit
+    def commit(
+        self,
+        pending_idx: Int32,
+        pending_valid: Boolean,
+        peer_ptrs: cute.Tensor,
+        offsets,
+        batch: Int32,
+        m_tile: Int32,
+        n_tile: Int32,
+        n_tiles,
+        valid: Boolean,
+        in_flight: cutlass.Constexpr,
+    ):
+        """Tile (batch, m_tile, n_tile) has issued its D stores. Publish
+        whatever is now provably visible and hold this tile.
+
+        in_flight: store groups this tile itself issued (epi_tile_num) — the
+        number left outstanding, and hence the depth of the deferral.
+        valid: False for a cluster-overhang CTA whose stores were predicated
+        away; its flag must not be published at all.
+
+        Returns the new (pending_idx, pending_valid).
+        """
+        cute.arch.cp_async_bulk_wait_group(in_flight)
+        cute.arch.fence_proxy("async")
+        self._release(peer_ptrs, pending_idx, pending_valid)
+        return self.sem.index(offsets, batch, m_tile, n_tile, n_tiles), valid
+
+    @cute.jit
+    def tail(self, pending_idx: Int32, pending_valid: Boolean, peer_ptrs: cute.Tensor):
+        """No more tiles. Release the held one; the caller must already have
+        drained the store pipeline (`epi_store_pipeline.producer_tail()`)."""
+        cute.arch.fence_proxy("async")
+        self._release(peer_ptrs, pending_idx, pending_valid)
+
+    @cute.jit
+    def _release(self, peer_ptrs: cute.Tensor, idx: Int32, valid: Boolean):
+        if valid:
+            if cute.arch.lane_idx() == 0:
+                self.sem.arrive(peer_ptrs, idx)

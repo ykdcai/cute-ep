@@ -32,6 +32,7 @@ import torch
 
 from quack.gemm import gemm as quack_gemm
 from tilepipe.args import TilePipeArgs
+from tilepipe.sync import RowBlockSemaphore
 
 print = functools.partial(print, flush=True)
 
@@ -173,7 +174,8 @@ def main():
                        tilepipe=TilePipeArgs(
                            tile_flag_ptrs=ptrs if publish else None,
                            tile_flag_offsets=tile_off if publish else None,
-                           tile_flag_stride=stride))
+                           tile_semaphore=RowBlockSemaphore(stride=stride)
+                           if publish else None))
 
         tag = f"{tile_m}x{tile_n} c{cluster_m}x{cluster_n}"
         try:

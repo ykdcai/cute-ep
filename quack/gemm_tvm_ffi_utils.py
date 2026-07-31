@@ -92,7 +92,14 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym):
 
 
 def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, tilepipe=None):
-    if cu_seqlens_m is None and cu_seqlens_k is None:
+    # The TilePipe tile-flag publish rides this struct but does not need
+    # varlen: it lives in the epilogue's shared tile loop, and GEMM->allreduce
+    # runs on a dense (TP) GEMM. So a dense call still needs the struct when
+    # flags are present; every varlen field stays None and the kernel's
+    # `varlen_m = cu_seqlens_m is not None` keeps the dense path.
+    if cu_seqlens_m is None and cu_seqlens_k is None and (
+        tilepipe is None or tilepipe.tile_flag_ptrs is None
+    ):
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
@@ -105,8 +112,8 @@ def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, tilepipe=None):
 def make_fake_varlen_args(
     varlen_m, varlen_k, gather_A, aidx_len, has_ready_flags=False, tile_flag_world=0
 ):
-    if not varlen_m and not varlen_k:
-        return None
+    if not varlen_m and not varlen_k and tile_flag_world == 0:
+        return None  # see make_varlen_args: tile flags do not imply varlen
     num_seqlens = cute.sym_int()
     return VarlenArguments(
         mCuSeqlensM=(
