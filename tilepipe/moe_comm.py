@@ -2344,14 +2344,19 @@ def write_kernel_results(tag, rows, meta, results_dir="bench_results"):
     results.json + results.md. `rows` is a list of dicts with at least
     tokens/ctas/time_ms/gbps."""
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # The backend belongs in the NAME: a simt and a tma sweep are otherwise
+    # identical directories differing only by timestamp, and telling them
+    # apart meant opening results.json.
+    impl = meta.get("impl")
     name = (f"{tag}_{meta['world']}gpu_h{meta['hidden']}_topk{meta['topk']}_"
-            f"e{meta['experts']}_{stamp}")
+            f"e{meta['experts']}" + (f"_{impl}" if impl else "") + f"_{stamp}")
     outdir = os.path.join(results_dir, name)
     os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "results.json"), "w") as f:
         json.dump({"config": meta, "rows": rows}, f, indent=2, default=str)
     lines = [f"# {tag} kernel benchmark ({meta['world']} GPUs)", "",
              f"- generated: {stamp}",
+             f"- impl={impl or 'n/a'} warps={meta.get('warps', 'n/a')}",
              f"- hidden/N={meta['hidden']} topk={meta['topk']} "
              f"experts={meta['experts']} stages={meta['stages']} "
              f"workers={meta['workers']}", "",
@@ -2564,8 +2569,12 @@ def run_tma_dispatch(num_tokens, hidden, num_experts, topk,
     compiled = cute.compile(kern, *dplan.compile_args(
         input_buf, recv_peer_ptrs, flag_peer_ptrs, ctas_list[0],
         rank, world_size, stream))
-    print(f"[rank {rank}] TMA dispatch kernel compiled "
-          f"(smem={kern._SharedStorage.size_in_bytes() / 1024:.0f} KB)", flush=True)
+    # Only the TMA backend stages through smem; the SIMT one has no
+    # _SharedStorage, and --comm-impl defaults to simt.
+    smem = getattr(kern, "_SharedStorage", None)
+    print(f"[rank {rank}] dispatch kernel compiled (impl={impl}"
+          + (f", smem={smem.size_in_bytes() / 1024:.0f} KB)" if smem else ")"),
+          flush=True)
 
     def reset():
         flags.fill_(0)
@@ -2735,8 +2744,11 @@ def main():
                          "correctness test + CTA sweep, then exit. Uses "
                          "--hidden as the GEMM N.")
     td.add_argument("--comm-impl", default="simt", choices=["simt", "tma"],
-                    help="[tma-dispatch/push-combine] varlen all-to-all backend "
-                         "(default simt: faster per SM at TilePipe CTA counts).")
+                    help="[tma-dispatch/push-combine] varlen all-to-all backend. "
+                         "Default simt is HISTORICAL, not best: at 4 GPUs / "
+                         "hidden 7168 tma is 1.6-1.7x faster at 8-16 CTAs (the "
+                         "regime TilePipe overlap runs in); they converge on the "
+                         "NVLink roofline above ~24 CTAs. See docs/status.md.")
     td.add_argument("--comm-warps", default=16, type=int,
                     help="[simt] warps per comm CTA.")
     td.add_argument("--dispatch-tma-workers", default=4, type=int,

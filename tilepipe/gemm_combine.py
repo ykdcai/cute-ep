@@ -1,10 +1,19 @@
 """
 TilePipe GEMM -> combine overlap (see tilepipe/docs/guide.md): the grouped GEMM is
-the PRODUCER — its epilogue publishes per-m-tile completion counters to every
-rank (quack_gemm tile_flag_ptrs) — and the gated TMA combine is the CONSUMER,
-pulling each token's topk expert-output rows from peers once their tiles are
-complete. Two kernels, two streams, disjoint SMs; scoped to one GEMM (in a
-real SwiGLU MoE layer this producer is the down-projection).
+the PRODUCER — its epilogue publishes per-m-tile completion counters — and the
+gated push-combine is the CONSUMER, streaming each expert-output row back to
+its token's home rank as soon as the row's tile is produced. Two kernels, two
+streams, disjoint SMs; scoped to one GEMM (in a real SwiGLU MoE layer this
+producer is the down-projection).
+
+PUSH ONLY. The pull combine (gated CombineTmaKernel, each rank fetching its
+own tokens' topk rows from peers) lost in both roles — serial 8.53 vs 6.81 ms
+and best-overlapped 0.90x vs 1.04x at 16K tokens — because readiness is
+per-token (all topk, so back-loaded) rather than per-expert, and the gate is a
+cross-rank busy-wait. It was removed from this pipeline; the kernel itself
+lives on in tilepipe/moe_comm.py as the standalone/serial combine. With pull
+gone this benchmark has NO cross-rank flag traffic: the GEMM publishes only to
+its own rank.
 
 Inputs are synthetic pre-dispatched activations (A already sits in each
 rank's expert-grouped buffer — dispatch overlap is the other, already-built
@@ -20,6 +29,7 @@ import datetime
 import functools
 import json
 import os
+from collections import namedtuple
 
 import numpy as np
 import torch
@@ -28,20 +38,18 @@ import torch.distributed as dist
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32
-from cutlass.cute.runtime import from_dlpack
 
 import cuda.bindings.driver as cuda_driver
 
 import nvshmem.core
 
 from tilepipe.moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
-                               CombineTmaKernel, make_varlen_all_to_all)
+                               make_varlen_all_to_all)
 
 from quack.gemm import gemm as quack_gemm
 from tilepipe.args import TilePipeArgs
 from tilepipe.plan import (build_combine_metadata, plan_combine,
-                           peer_ptr_tensor, dyn)
+                           peer_ptr_tensor)
 
 # Stage prints are hang diagnostics — they must not sit in a stdio buffer.
 print = functools.partial(print, flush=True)
@@ -95,7 +103,7 @@ def run(args):
     total_m = meta["rank_rows"][rank]
     max_rows = max(max(meta["rank_rows"]), 1)
     print(f"[rank {rank}] metadata built: total_m={total_m} max_rows={max_rows} "
-          f"total_tiles={meta['total_tiles']}")
+          f"local m-tiles={len(meta['tile_lo'])}")
 
     # --- Local GEMM operands (deterministic per rank for references) ---
     weights_bytes = epr * n * k * 2
@@ -105,32 +113,30 @@ def run(args):
     A = rank_tensor(500 + rank, (total_m, k), device, scale=k ** -0.5)
     weights = build_weights(rank, epr, n, k, device)
 
-    # --- Symmetric buffers: expert output D (peers pull rows) + tile flags ---
+    # --- Symmetric buffer: expert output D (rows are pushed FROM here) ---
     d_buf = nvshmem.core.tensor((max_rows, n), dtype=torch.bfloat16)
     d_buf.fill_(0)
-    tile_flags = nvshmem.core.tensor((meta["total_tiles"],), dtype=torch.int32)
-    tile_flags.fill_(0)
-    d_peer_ptrs = peer_ptr_tensor(d_buf, world_size, device)
-    # The GEMM publishes relative to ITS segment of each rank's flag array.
-    flag_pub_ptrs = torch.tensor(
-        [nvshmem.core.get_peer_tensor(tile_flags, r).data_ptr()
-         + int(meta["rank_tile_base"][rank]) * 4
-         for r in range(world_size)], device=device, dtype=torch.int64)
-    print(f"[rank {rank}] symmetric buffers allocated "
-          f"({(max_rows * n * 2 + meta['total_tiles'] * 4) / 1e9:.3f} GB)")
+    print(f"[rank {rank}] symmetric D allocated ({max_rows * n * 2 / 1e9:.3f} GB)")
 
     D = d_buf[:total_m]
     cu_seqlens_m = torch.from_numpy(meta["cu_seqlens"]).to(device)
     tile_offsets_t = torch.from_numpy(meta["tile_offsets"]).to(device)
     scatter_t = torch.from_numpy(meta["scatter"]).to(device)
-    flag_idx_t = torch.from_numpy(meta["flag_idx"]).to(device)
     combine_out = torch.zeros((args.tokens, n), dtype=torch.bfloat16, device=device)
-    ntok_t = torch.full((world_size,), args.tokens, dtype=torch.int32, device=device)
 
-    def launch_gemm(publish, max_clusters=None, stream=None, local_publish=False):
-        # publish=False: plain GEMM. local_publish=True: push-combine mode —
-        # flags land only on this rank (1-entry pointer table).
-        ptrs = (flag_pub_local if local_publish else flag_pub_ptrs) if publish else None
+    # Tile flags are rank-LOCAL: the GEMM publishes one counter per local
+    # m-tile (per-expert tiling, `tile_offsets`) and the push kernel gates on
+    # this rank's own counters -- no cross-rank flag traffic. Sized by the
+    # PRODUCER's tile count (len(tile_lo)), not by the consumer's max gate
+    # index: a trailing tile with no rows to push would otherwise leave the
+    # epilogue publishing one past the end.
+    local_tiles = len(meta["tile_lo"])
+    tile_flags_local = torch.zeros(local_tiles, dtype=torch.int32, device=device)
+    flag_pub_local = torch.tensor([tile_flags_local.data_ptr()],
+                                  device=device, dtype=torch.int64)
+
+    def launch_gemm(publish, max_clusters=None, stream=None):
+        ptrs = flag_pub_local if publish else None
         with torch.cuda.stream(stream if stream is not None else
                                torch.cuda.current_stream()):
             quack_gemm(
@@ -142,40 +148,18 @@ def run(args):
                     tile_flag_ptrs=ptrs,
                     tile_flag_offsets=tile_offsets_t if publish else None))
 
-    # --- Combine kernel (gated; hchunk must divide N) ---
-    assert n % args.hchunk == 0, "--hchunk must divide --gemm-n"
-    combine_kernel = CombineTmaKernel(
-        cutlass.BFloat16, n, args.topk, hchunk=args.hchunk,
-        num_stages=args.combine_stages)
-    # All token-dependent extents are dynamic so ONE compile serves every
-    # token count (production: the count changes every step).
-    peer_tensors = [dyn(nvshmem.core.get_peer_tensor(d_buf, r), leading_dim=1)
-                    for r in range(world_size)]
-    base_args = lambda: (
-        peer_tensors, dyn(combine_out, leading_dim=1),
-        dyn(topk_indices, leading_dim=1), dyn(scatter_t, leading_dim=1),
-        from_dlpack(ntok_t))
-    gate_args = lambda: (
-        dyn(tile_flags), dyn(flag_idx_t, leading_dim=1), Int32(n_tiles))
-
     # --- Push-combine (reverse dispatch): this rank PUSHES each of its D rows
     # back to the token's home rank as soon as the row's tile is produced, and
     # the home rank reduces staging[token, topk, N] locally. Row readiness is
-    # per-EXPERT (uniform across the GEMM window), unlike the pull combine's
-    # per-token readiness (all topk => back-loaded), so overlap is much better.
-    # The gate is LOCAL here: rank r waits on rank r's own tile counters.
+    # per-EXPERT (uniform across the GEMM window), so rows become pushable
+    # early and evenly across the GEMM window.
     pplan = plan_combine(all_topk, args.experts, rank, world_size,
                          tile_m=args.tile_m)
     p_gate = pplan.gate_idx
-    dev = lambda a: torch.from_numpy(a).to(device)
-    # Push mode's gate space is rank-LOCAL (0-based per-expert m-tiles, same
-    # tiling rule the GEMM epilogue publishes with), so it gets its own local
-    # flag array and a 1-entry publish pointer table: arrive_all then writes
-    # only to this rank — no cross-rank flag traffic at all.
-    local_tiles = int(p_gate.max()) + 1 if len(p_gate) else 1
-    tile_flags_local = torch.zeros(local_tiles, dtype=torch.int32, device=device)
-    flag_pub_local = torch.tensor([tile_flags_local.data_ptr()],
-                                  device=device, dtype=torch.int64)
+    # Same index space the GEMM epilogue publishes in (plan.py derives both
+    # from the per-expert m-tile offsets); assert rather than assume.
+    assert len(p_gate) == 0 or int(p_gate.max()) < local_tiles, (
+        f"gate index {int(p_gate.max())} outside producer tile range {local_tiles}")
     stage_rows = pplan.dst_rows
     staging = nvshmem.core.tensor((stage_rows, n), dtype=torch.bfloat16)
     staging.fill_(0)
@@ -194,7 +178,7 @@ def run(args):
         gate_flags=tile_flags_local, gate_target=n_tiles)
     print(f"[rank {rank}] push-combine: {pplan.n_rows} rows, staging "
           f"{stage_rows * n * 2 / 1e9:.3f} GB")
-    print(f"[rank {rank}] compiling combine (gated + ungated)...")
+    print(f"[rank {rank}] compiling push-combine (gated + ungated)...")
     comm_stream = torch.cuda.Stream(priority=-1)
     gemm_stream = torch.cuda.Stream()
     cs = lambda s: cuda_driver.CUstream(s.cuda_stream)
@@ -202,20 +186,23 @@ def run(args):
     # NOTE cute launches ignore torch.cuda.stream() contexts — the stream is
     # passed explicitly (a default-stream combine under comm_stream events
     # silently measured nothing).
-    combine_gated = {c: cute.compile(combine_kernel, *base_args(), epr, rank,
-                                     world_size, c, cur(), *gate_args())
-                     for c in args.combine_ctas_list}
-    combine_ungated = {c: cute.compile(combine_kernel, *base_args(), epr, rank,
-                                       world_size, c, cur())
-                       for c in args.combine_ctas_list}
-    push_compiled = {c: cute.compile(push_kernel, *dplan.compile_args(
+    push_gated = {c: cute.compile(push_kernel, *dplan.compile_args(
         d_buf, stage_peer_ptrs, None, c, rank, world_size, cur(),
         gate_flags=tile_flags_local, gate_target=n_tiles))
         for c in args.combine_ctas_list}
-    print(f"[rank {rank}] combine + push kernels compiled")
+    # Ungated twin: the comm cost with no producer coupling at all. This is
+    # the standalone combine number -- what there is to hide, and the comm
+    # half of the speed-of-light bound.
+    push_ungated = {c: cute.compile(push_kernel, *dplan.compile_args(
+        d_buf, stage_peer_ptrs, None, c, rank, world_size, cur()))
+        for c in args.combine_ctas_list}
+    print(f"[rank {rank}] push kernels compiled")
 
     def launch_push(c, strm):
-        push_compiled[c](*push_args(c, cs(strm)))
+        push_gated[c](*push_args(c, cs(strm)))
+
+    def launch_push_ungated(c, strm):
+        push_ungated[c](*dplan.args(d_buf, stage_peer_ptrs, None, c, cs(strm)))
 
     def launch_reduce(strm):
         # Plain local contraction. CALLER MUST have barriered after the pushes:
@@ -225,7 +212,6 @@ def run(args):
                       out=combine_out)
 
     def reset():
-        tile_flags.fill_(0)
         tile_flags_local.zero_()
         dplan.reset()
         combine_out.zero_()
@@ -243,14 +229,14 @@ def run(args):
     launch_gemm(publish=True)
     launch_gemm(publish=False)
     barrier()
-    # Every producer publishes to every rank, so the whole array lands on
-    # n_tiles.
-    exp_flags = torch.full((meta["total_tiles"],), n_tiles, dtype=torch.int32)
-    ok_flags = torch.equal(tile_flags.cpu(), exp_flags)
+    # One publish per (m-tile, n-tile): every local counter lands on n_tiles.
+    # A plain GEMM must add nothing, which the second launch above checks.
+    exp_flags = torch.full((local_tiles,), n_tiles, dtype=torch.int32)
+    ok_flags = torch.equal(tile_flags_local.cpu(), exp_flags)
     print(f"[rank {rank}] GEMM tile flags {'OK' if ok_flags else 'FAIL'}")
     if not ok_flags:
         raise SystemExit(f"[rank {rank}] tile-flag publish FAILED: "
-                         f"{tile_flags.cpu().tolist()[:16]}...")
+                         f"{tile_flags_local.cpu().tolist()[:16]}...")
 
     # Reference: rebuild every peer's D and gather (fp32 accumulate). Memory-
     # tight on crowded GPUs: peer weights are rebuilt ONE EXPERT at a time
@@ -297,32 +283,12 @@ def run(args):
         dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
         return bool(ok_t.item())
 
-    # Combine warm-up + serial correctness (flags already satisfied).
+    # --- Serial correctness. Also the warm-up EXECUTION of every push kernel
+    # (lazy module load device-syncs, which deadlocks against a spinning gate,
+    # so nothing may reach the overlapped region uninstantiated) ---
     c0 = args.combine_ctas_list[0]
-    combine_gated[c0](*base_args(), cur(), *gate_args())
-    barrier()
-    if not check("serial GEMM->combine"):
-        raise SystemExit("serial correctness FAILED")
-    combine_ungated[c0](*base_args(), cur())
-    barrier()
-
-    # --- Overlapped correctness: combine first (high-priority comm stream,
-    # it spins on flags), then the capped publishing GEMM ---
-    def overlapped(c_ctas):
-        combine_gated[c_ctas](*base_args(), cs(comm_stream), *gate_args())
-        launch_gemm(publish=True, max_clusters=num_sms - c_ctas,
-                    stream=gemm_stream)
-
     reset()
-    overlapped(c0)
-    barrier()
-    if not check("overlapped GEMM->combine (pull)"):
-        raise SystemExit("overlapped pull correctness FAILED")
-
-    # --- Push-combine: warm-up EXECUTION of every kernel (lazy module load
-    # deadlocks against a spinning gate), then serial + overlapped checks ---
-    reset()
-    launch_gemm(publish=True, local_publish=True)
+    launch_gemm(publish=True)
     launch_push(c0, comm_stream)
     barrier()          # peers' pushes complete here
     launch_reduce(comm_stream)
@@ -330,14 +296,28 @@ def run(args):
     if not check("serial GEMM->push-combine"):
         raise SystemExit("push-combine serial correctness FAILED")
 
+    # Ungated twin, same expected result: it is the standalone comm number, so
+    # it must be shown to be a like-for-like substitute for the gated kernel
+    # and not merely a faster one. Nothing orders it against the GEMM -- that
+    # is the whole point of the ungated form -- so the producer is fenced with
+    # a full barrier rather than a flag.
+    reset()
+    launch_gemm(publish=False)
+    barrier()
+    launch_push_ungated(c0, comm_stream)
+    barrier()
+    launch_reduce(comm_stream)
+    barrier()
+    if not check("serial GEMM->push-combine (ungated)"):
+        raise SystemExit("ungated push-combine correctness FAILED")
+
     def overlapped_push(c_ctas):
         # Push kernel first on the high-priority stream: it gates on this
         # rank's own tile counters, so it streams rows out as the GEMM
-        # produces them. The reduce follows on the same stream behind the
-        # arrival gate.
+        # produces them. The reduce follows after the pipeline's barrier.
         launch_push(c_ctas, comm_stream)
-        launch_gemm(publish=True, local_publish=True,
-                    max_clusters=num_sms - c_ctas, stream=gemm_stream)
+        launch_gemm(publish=True, max_clusters=num_sms - c_ctas,
+                    stream=gemm_stream)
 
     reset()
     overlapped_push(c0)
@@ -349,7 +329,6 @@ def run(args):
 
     def free_symmetric():
         nvshmem.core.free_tensor(d_buf)
-        nvshmem.core.free_tensor(tile_flags)
         nvshmem.core.free_tensor(staging)
 
     if not args.benchmark:
@@ -357,11 +336,21 @@ def run(args):
         return None
 
     # --- Benchmark ---
-    def time_iters(enqueue, pre_reset):
-        times = []
+    # Per-STREAM durations, not just the wall time. In the overlapped run the
+    # two streams carry one kernel each, so `comm` is the push's own span and
+    # `gemm` the GEMM's own span, both measured from the same start event.
+    # Comparing them against the standalone numbers separates "the GEMM got
+    # slower from contention" from "the comm ran past the GEMM" -- the wall
+    # time alone cannot tell those apart.
+    Timing = namedtuple("Timing", "total comm gemm")
+
+    def time_iters(enqueue, pre=None):
+        # `pre` runs BEFORE the start event, so per-iteration setup (counter
+        # resets, pre-satisfying a gate) never lands inside the timed window.
+        tot, t_c, t_g = [], [], []
         for it in range(args.warmup + args.iters):
-            if pre_reset:
-                reset()
+            if pre is not None:
+                pre()
             else:
                 barrier()
             start = torch.cuda.Event(enable_timing=True)
@@ -375,66 +364,91 @@ def run(args):
             end_b.record(gemm_stream)
             torch.cuda.synchronize()
             if it >= args.warmup:
-                times.append(max(start.elapsed_time(end_a),
-                                 start.elapsed_time(end_b)))
-        t = torch.tensor([float(np.median(times))], device=device)
+                a, b = start.elapsed_time(end_a), start.elapsed_time(end_b)
+                tot.append(max(a, b))
+                t_c.append(a)
+                t_g.append(b)
+        med = lambda xs: float(np.median(xs))
+        t = torch.tensor([med(tot), med(t_c), med(t_g)], device=device)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
-        return t.item()
+        return Timing(*t.tolist())
 
     if rank == 0:
-        print("\nbenchmark: pure GEMM / pure combine / serial / overlapped...")
-    tile_flags.fill_(n_tiles)
-    barrier()
+        print("\nbenchmark: pure GEMM / pure push / capped GEMM / serial / overlapped...")
+
+    # --- Each component alone, then the two compositions. ---
     t_gemm_plain = time_iters(
-        lambda: launch_gemm(publish=False, stream=gemm_stream), pre_reset=False)
+        lambda: launch_gemm(publish=False, stream=gemm_stream)).total
     t_gemm_pub = time_iters(
-        lambda: launch_gemm(publish=True, stream=gemm_stream), pre_reset=True)
-    t_comb = {c: time_iters(
-        lambda: combine_ungated[c](*base_args(), cs(comm_stream)),
-        pre_reset=False) for c in args.combine_ctas_list}
-
-    def serial(c):
-        launch_gemm(publish=True, stream=comm_stream)
-        combine_gated[c](*base_args(), cs(comm_stream), *gate_args())
-
-    # Fair serial baseline: each phase gets the whole GPU, so the combine
-    # runs with the LARGEST CTA count in the sweep (a small-CTA serial
-    # combine would pad the baseline and flatter the overlap numbers).
-    c_serial = max(args.combine_ctas_list)
-    t_serial = time_iters(lambda: serial(c_serial), pre_reset=True)
-    t_over = {c: time_iters(lambda: overlapped(c), pre_reset=True)
-              for c in args.combine_ctas_list}
+        lambda: launch_gemm(publish=True, stream=gemm_stream), pre=reset).total
+    # STANDALONE COMM. The push kernel compiled with no gate at all, so this
+    # is pure transfer cost with no producer coupling -- the single most
+    # important number here: it sets what there is to hide, and it is the
+    # comm half of the speed-of-light bound below.
+    t_push_alone = {c: time_iters(
+        lambda: launch_push_ungated(c, comm_stream), pre=reset).total
+        for c in args.combine_ctas_list}
+    # The publishing GEMM restricted to the SMs the overlap leaves it. NOT
+    # used for the ideal (that stays speed-of-light, see below) -- this is the
+    # SM tax on its own, measured rather than modelled, and it is what tells
+    # us whether max_active_clusters really frees the SMs we assume.
+    t_gemm_capped = {c: time_iters(
+        lambda: launch_gemm(publish=True, max_clusters=num_sms - c,
+                            stream=gemm_stream), pre=reset).total
+        for c in args.combine_ctas_list}
 
     def serial_push(c):
         # Reduce excluded: it needs a cross-rank barrier, so it is measured
-        # separately (t_reduce) and added to both serial and overlapped.
-        launch_gemm(publish=True, local_publish=True, stream=comm_stream)
+        # separately (t_reduce) and applies equally to serial and overlapped.
+        launch_gemm(publish=True, stream=comm_stream)
         launch_push(c, comm_stream)
 
-    t_push_serial = time_iters(lambda: serial_push(c_serial), pre_reset=True)
-    t_reduce = time_iters(lambda: launch_reduce(comm_stream), pre_reset=False)
-    t_push_over = {c: time_iters(lambda: overlapped_push(c), pre_reset=True)
-                   for c in args.combine_ctas_list}
+    # Fair serial baseline: each phase gets the whole GPU, so the push runs
+    # with the LARGEST CTA count in the sweep (a small-CTA serial push would
+    # pad the baseline and flatter the overlap numbers).
+    c_serial = max(args.combine_ctas_list)
+    t_push_serial = time_iters(lambda: serial_push(c_serial), pre=reset).total
+    t_reduce = time_iters(lambda: launch_reduce(comm_stream)).total
+    # Keep the full per-stream split here: `ovl[c].gemm` is the GEMM's own
+    # span inside the overlap (vs t_gemm_capped -> contention) and
+    # `ovl[c].comm` is the push's own span (vs t_push_alone -> gate stall +
+    # drain). This is the only run where the two kernels are concurrent.
+    ovl = {c: time_iters(lambda: overlapped_push(c), pre=reset)
+           for c in args.combine_ctas_list}
+    t_push_over = {c: ovl[c].total for c in args.combine_ctas_list}
+
+    # Speed of light: the full-device GEMM against the comm it has to hide.
+    # Deliberately NOT max(t_gemm_capped[c], ...) -- we want the absolute
+    # bound the whole approach is aiming at, not the bound conditioned on the
+    # SM split we happen to be using. The SM tax shows up separately, as the
+    # gap between `gemm@cap` and the full-device GEMM.
+    ideal = {c: max(t_gemm_pub, t_push_alone[c]) for c in args.combine_ctas_list}
 
     if rank == 0:
         flops = 2 * total_m * n * k
         print(f"\npure GEMM   ({num_sms} SMs): {t_gemm_plain:8.3f} ms "
               f"({flops / t_gemm_plain / 1e9:.0f} TFLOPS); with publish: "
               f"{t_gemm_pub:8.3f} ms ({(t_gemm_pub / t_gemm_plain - 1) * 100:+.1f}%)")
-        for c in args.combine_ctas_list:
-            print(f"pure combine ({c:3d} CTAs): {t_comb[c]:8.3f} ms")
-        print(f"serial (GEMM then combine @{c_serial} CTAs): {t_serial:8.3f} ms")
-        print(f"serial (GEMM then push-combine @{c_serial} CTAs): "
-              f"{t_push_serial:8.3f} ms")
+        print(f"serial (GEMM then push @{c_serial} CTAs): {t_push_serial:8.3f} ms")
         print(f"local reduce (after barrier, both paths): {t_reduce:8.3f} ms")
-        print(f"\n{'ctas':>6} {'pull-ovl':>10} {'vs ser':>8} {'vs ideal':>9}"
-              f" | {'push-ovl':>10} {'vs ser':>8} {'vs push-ser':>12}")
+        print(f"\n{'ctas':>5} {'push alone':>11} {'gemm@cap':>10} {'SMtax%':>7}"
+              f" | {'ideal(SoL)':>11} {'ovl':>9} {'vs ideal':>9} {'vs serial':>10}")
         for c in args.combine_ctas_list:
-            ideal = max(t_gemm_pub, t_comb[c])
-            print(f"{c:>6} {t_over[c]:>8.3f}ms {t_serial / t_over[c]:>7.2f}x "
-                  f"{t_over[c] / ideal:>8.2f}x | {t_push_over[c]:>8.3f}ms "
-                  f"{t_serial / t_push_over[c]:>7.2f}x "
-                  f"{t_push_serial / t_push_over[c]:>11.2f}x")
+            print(f"{c:>5} {t_push_alone[c]:>9.3f}ms {t_gemm_capped[c]:>8.3f}ms "
+                  f"{(t_gemm_capped[c] / t_gemm_pub - 1) * 100:>6.1f}% | "
+                  f"{ideal[c]:>9.3f}ms {t_push_over[c]:>7.3f}ms "
+                  f"{t_push_over[c] / ideal[c]:>8.2f}x "
+                  f"{t_push_serial / t_push_over[c]:>9.2f}x")
+        # Where the overlap's excess actually goes. Both columns are measured
+        # INSIDE the same overlapped run, against the standalone baselines.
+        print(f"\n{'ctas':>5} | {'gemm in-ovl':>12} {'vs @cap':>8} (contention)"
+              f" | {'push in-ovl':>12} {'vs alone':>9} (stall+drain)")
+        for c in args.combine_ctas_list:
+            g, p = ovl[c].gemm, ovl[c].comm
+            print(f"{c:>5} | {g:>10.3f}ms {g - t_gemm_capped[c]:>+7.3f}ms "
+                  f"{(g / t_gemm_capped[c] - 1) * 100:>+11.1f}% | "
+                  f"{p:>10.3f}ms {p - t_push_alone[c]:>+8.3f}ms "
+                  f"{(p / t_push_alone[c] - 1) * 100:>+12.1f}%")
 
     free_symmetric()
     return dict(
@@ -443,12 +457,12 @@ def run(args):
         gemm_ms=t_gemm_plain, gemm_publish_ms=t_gemm_pub,
         gemm_tflops=2 * total_m * n * k / t_gemm_plain / 1e9,
         publish_overhead_pct=(t_gemm_pub / t_gemm_plain - 1) * 100,
-        serial_pull_ms=t_serial, serial_push_ms=t_push_serial,
-        reduce_ms=t_reduce,
-        serial_ctas=c_serial,
-        combine_ms={c: t_comb[c] for c in args.combine_ctas_list},
-        pull_overlapped_ms={c: t_over[c] for c in args.combine_ctas_list},
+        serial_push_ms=t_push_serial, reduce_ms=t_reduce, serial_ctas=c_serial,
+        push_alone_ms=t_push_alone, gemm_capped_ms=t_gemm_capped, ideal_ms=ideal,
         push_overlapped_ms={c: t_push_over[c] for c in args.combine_ctas_list},
+        # Per-stream spans measured inside the overlapped run.
+        ovl_gemm_ms={c: ovl[c].gemm for c in args.combine_ctas_list},
+        ovl_push_ms={c: ovl[c].comm for c in args.combine_ctas_list},
     )
 
 
@@ -468,39 +482,56 @@ def write_results(results, args, world_size):
                              for k, v in r.items()} for r in results]},
                   f, indent=2, default=str)
 
-    lines = [f"# TilePipe GEMM -> combine ({world_size} GPUs)", "",
+    lines = [f"# TilePipe GEMM -> push-combine ({world_size} GPUs)", "",
              f"- generated: {stamp}",
              f"- K={args.hidden} N={args.n} topk={args.topk} "
              f"experts={args.experts} tile={args.tile_m}x{args.tile_n}",
-             f"- combine CTAs swept: {args.combine_ctas_list}", ""]
+             f"- comm CTAs swept: {args.combine_ctas_list}", ""]
     lines += ["## Summary (best overlapped vs serial)", "",
-              "| tokens/rank | GEMM ms | +publish | pure combine (best) | "
-              "serial pull | serial push | best pull-ovl | best push-ovl | "
-              "best push vs push-ser |", "|---|---|---|---|---|---|---|---|---|"]
+              "| tokens/rank | GEMM ms | +publish | push alone (best) | "
+              "serial push | best ovl | vs serial | vs ideal |",
+              "|---|---|---|---|---|---|---|---|"]
     for r in results:
-        bc = min(r["combine_ms"].values())
-        bp = min(r["pull_overlapped_ms"].values())
-        bs = min(r["push_overlapped_ms"].values())
+        bc = min(r["push_alone_ms"].values())
+        best_c = min(r["push_overlapped_ms"], key=r["push_overlapped_ms"].get)
+        bs = r["push_overlapped_ms"][best_c]
         lines.append(
             f"| {r['tokens']} | {r['gemm_ms']:.3f} | "
             f"{r['publish_overhead_pct']:+.1f}% | {bc:.3f} | "
-            f"{r['serial_pull_ms']:.3f} | {r['serial_push_ms']:.3f} | "
-            f"{bp:.3f} | {bs:.3f} | {r['serial_push_ms'] / bs:.2f}x |")
+            f"{r['serial_push_ms']:.3f} | {bs:.3f} (@{best_c}) | "
+            f"{r['serial_push_ms'] / bs:.2f}x | "
+            f"{bs / r['ideal_ms'][best_c]:.2f}x |")
     for r in results:
         lines += ["", f"## tokens/rank = {r['tokens']} (total_m={r['total_m']})", "",
                   f"pure GEMM {r['gemm_ms']:.3f} ms ({r['gemm_tflops']:.0f} TFLOPS); "
                   f"with publish {r['gemm_publish_ms']:.3f} ms "
                   f"({r['publish_overhead_pct']:+.1f}%)",
-                  f"serial pull @{r['serial_ctas']} CTAs {r['serial_pull_ms']:.3f} ms; "
-                  f"serial push {r['serial_push_ms']:.3f} ms", "",
-                  "| CTAs | pure combine | pull-ovl | vs pull-ser | push-ovl | "
-                  "vs push-ser |", "|---|---|---|---|---|---|"]
-        for c in sorted(r["combine_ms"]):
+                  f"serial @{r['serial_ctas']} CTAs {r['serial_push_ms']:.3f} ms; "
+                  f"local reduce {r['reduce_ms']:.3f} ms (excluded from both)", "",
+                  "ideal = speed of light = max(full-device publishing GEMM, "
+                  "push alone). The SM tax is reported separately rather than "
+                  "folded into the bound.", "",
+                  "| CTAs | push alone | GEMM @cap | SM tax % | ideal (SoL) | "
+                  "overlapped | vs ideal | vs serial |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for c in sorted(r["push_alone_ms"]):
             lines.append(
-                f"| {c} | {r['combine_ms'][c]:.3f} | {r['pull_overlapped_ms'][c]:.3f} "
-                f"| {r['serial_pull_ms'] / r['pull_overlapped_ms'][c]:.2f}x "
-                f"| {r['push_overlapped_ms'][c]:.3f} "
+                f"| {c} | {r['push_alone_ms'][c]:.3f} "
+                f"| {r['gemm_capped_ms'][c]:.3f} "
+                f"| {(r['gemm_capped_ms'][c] / r['gemm_publish_ms'] - 1) * 100:+.1f}% "
+                f"| {r['ideal_ms'][c]:.3f} | {r['push_overlapped_ms'][c]:.3f} "
+                f"| {r['push_overlapped_ms'][c] / r['ideal_ms'][c]:.2f}x "
                 f"| {r['serial_push_ms'] / r['push_overlapped_ms'][c]:.2f}x |")
+        lines += ["", "Per-stream spans measured inside the overlapped run: "
+                  "GEMM vs its standalone capped time isolates contention; push "
+                  "vs its standalone time isolates gate stall + drain.", "",
+                  "| CTAs | GEMM in-ovl | vs @cap | push in-ovl | vs alone |",
+                  "|---|---|---|---|---|"]
+        for c in sorted(r["push_alone_ms"]):
+            g, p = r["ovl_gemm_ms"][c], r["ovl_push_ms"][c]
+            lines.append(
+                f"| {c} | {g:.3f} | {(g / r['gemm_capped_ms'][c] - 1) * 100:+.1f}% "
+                f"| {p:.3f} | {(p / r['push_alone_ms'][c] - 1) * 100:+.1f}% |")
     with open(os.path.join(outdir, "results.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\nresults written to {outdir}/ (results.json, results.md)")
@@ -523,13 +554,15 @@ def main():
     parser.add_argument("--tile-n", type=int, default=256,
                         help="fastest cluster-1x1 config is 128x256; it also "
                              "halves the tile-flag publishes per row")
-    parser.add_argument("--hchunk", type=int, default=2048,
-                        help="combine bulk tile elems (must divide gemm-n)")
-    parser.add_argument("--combine-stages", type=int, default=8)
     parser.add_argument("--combine-ctas", type=str, default="12,24,36,48",
-                        help="comma-separated combine CTA (= comm SM) counts")
-    parser.add_argument("--comm-impl", choices=["simt", "tma"], default="simt",
-                        help="push-combine backend (default simt)")
+                        help="comma-separated push-combine CTA (= comm SM) counts")
+    parser.add_argument("--comm-impl", choices=["simt", "tma"], default="tma",
+                        help="push-combine backend. Default tma: measured "
+                             "1.2x (N=4096) to 1.7x (N=7168) faster than simt "
+                             "at 8-16 CTAs, which is the regime the SM tax "
+                             "forces the overlap into. They converge on the "
+                             "NVLink roofline above ~24 CTAs, where simt's "
+                             "36-CTA point is actually the better one.")
     parser.add_argument("--comm-warps", type=int, default=16,
                         help="[simt] warps per push-combine CTA")
     parser.add_argument("--push-stages", type=int, default=12,
