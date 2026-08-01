@@ -1221,6 +1221,223 @@ class VarlenAllToAllSimtKernel:
                                     world_size, gate_flags is not None)
 
 
+# ---------------------------------------------------------------------------
+# Push-combine: a DEDICATED kernel, deliberately not the shared all-to-all.
+# ---------------------------------------------------------------------------
+# The shared VarlenAllToAllKernel gives each worker a CONTIGUOUS block of the
+# row list. For dispatch that is right: a segment's rows stay together, so one
+# worker owns a segment and can publish its arrival counter.
+#
+# For push-combine it is the thing that killed the overlap. The row list is in
+# PRODUCER order (expert-major, monotone gate indices), so a contiguous block
+# means worker w owns rows that only become ready at ~w/W of the way through
+# the GEMM. The last worker cannot start until the GEMM is nearly done and
+# then still has its whole share left, which makes
+#
+#     overlapped ~= gemm@cap + push_alone      (measured: 6.76+2.37 = 9.13
+#                                               predicted vs 9.13 actual)
+#
+# i.e. the comm is serialized against the GEMM by its own work partition. It is
+# not contention (measured at +1.3% with a pre-satisfied gate), not poll
+# frequency (~43 polls per CTA), and not readiness (linear in GEMM progress,
+# complete by ~65%).
+#
+# Here workers instead take chunks ROUND-ROBIN, so every worker sits at the
+# same readiness frontier and they consume newly-completed tiles together:
+# worker w takes chunks w, w+W, w+2W, ... of CHUNK rows each. Gate indices stay
+# monotone within a worker (w, w+W, ... is increasing), so the one-poll-per-
+# tile caching survives. CHUNK ~ tile_m keeps that to ~1-2 polls per chunk.
+#
+# Splitting a segment across workers is exactly what dispatch cannot tolerate,
+# which is why this is a separate kernel rather than a mode: push-combine has
+# no arrival counter to publish (the local reduce is ordered by the pipeline's
+# barrier), so there is no segment bookkeeping here at all.
+
+class PushCombineKernel:
+    """Gated row pusher for GEMM -> combine. TMA bulk backend, round-robin
+    chunk partition, pure data movement (no segments, no arrival publish).
+
+    Drive it via tilepipe.plan.plan_combine -> DeviceCommPlan.push_args()."""
+
+    WRITE_WINDOW = 8  # in-flight remote writes per worker
+
+    def __init__(self, dtype, hidden, num_stages: int = 12, workers: int = 4,
+                 chunk: int = 128):
+        self.dtype = dtype
+        self.hidden = hidden
+        self.NUM_STAGES = num_stages
+        self.WORKERS = workers
+        self.CHUNK = chunk
+        assert num_stages % workers == 0, "num_stages must divide by workers"
+        assert num_stages // workers >= 2, "each worker needs >=2 stages"
+        row_bytes = hidden * dtype.width // 8
+        assert row_bytes % 16 == 0, "bulk copy needs 16B-aligned rows"
+        self.tx_count = row_bytes
+        stages, elems = num_stages, hidden
+
+        @cute.struct
+        class SharedStorage:
+            mbar_array: cute.struct.MemRange[cutlass.Int64, stages * 2]
+            smem_buffer: cute.struct.Align[
+                cute.struct.MemRange[dtype, elems * stages], 128
+            ]
+
+        self._SharedStorage = SharedStorage
+
+    @cute.jit
+    def __call__(
+        self,
+        src_buf: cute.Tensor,         # [max_rows, hidden] local GEMM output
+        dst_peer_ptrs: cute.Tensor,   # [world] int64 staging bases
+        send_row: cute.Tensor,        # [n_rows] int32 (== arange, buffer order)
+        send_slot: cute.Tensor,       # [n_rows] int32 destination slot
+        send_dst: cute.Tensor,        # [n_rows] int32 destination rank
+        gate_idx: cute.Tensor,        # [n_rows] int32 producer tile counter
+        n_rows: Int32,
+        dst_rows: Int32,
+        gate_flags: cute.Tensor,      # local tile flags
+        gate_target: Int32,           # ceil(N / tile_N)
+        num_ctas: Int32,
+        stream: cuda_driver.CUstream,
+    ):
+        in_total = cute.size(src_buf.layout)
+        in_flat = cute.make_tensor(src_buf.iterator, cute.make_layout((in_total,)))
+        self.kernel(
+            in_flat, dst_peer_ptrs, send_row, send_slot, send_dst, gate_idx,
+            n_rows, dst_rows, gate_flags, gate_target,
+        ).launch(
+            grid=[num_ctas, 1, 1],
+            block=[self.WORKERS * 64, 1, 1],  # producer + consumer warp each
+            smem=self._SharedStorage.size_in_bytes(),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        in_flat: cute.Tensor,
+        dst_peer_ptrs: cute.Tensor,
+        send_row: cute.Tensor,
+        send_slot: cute.Tensor,
+        send_dst: cute.Tensor,
+        gate_idx: cute.Tensor,
+        n_rows: Int32,
+        dst_rows: Int32,
+        gate_flags: cute.Tensor,
+        gate_target: Int32,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        bidx = cute.arch.block_idx()[0]
+        gdim = cute.arch.grid_dim()[0]
+        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane_id = tidx % 32
+        WORKERS = cutlass.const_expr(self.WORKERS)
+        SPW = cutlass.const_expr(self.NUM_STAGES // self.WORKERS)
+        WWIN = cutlass.const_expr(self.WRITE_WINDOW)
+        CHUNK = cutlass.const_expr(self.CHUNK)
+        hidden = cutlass.const_expr(self.hidden)
+        tiler = (hidden,)
+
+        smem = cute_utils.SmemAllocator()
+        storage = smem.allocate(self._SharedStorage)
+        staged_all = storage.smem_buffer.get_tensor(
+            cute.make_layout((hidden, self.NUM_STAGES)))
+        mbar_base = storage.mbar_array.data_ptr()
+        pipes = []
+        for w in cutlass.range_constexpr(WORKERS):
+            pipes.append(pipeline.PipelineTmaAsync.create(
+                barrier_storage=mbar_base + w * SPW * 2,
+                num_stages=SPW,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                tx_count=self.tx_count,
+                cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)),
+            ))
+
+        src_tiled = cute.zipped_divide(in_flat, tiler)
+        g2s_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), self.dtype)
+        s2g_atom = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), self.dtype)
+
+        # Round-robin chunk assignment. Producer and consumer warps MUST walk
+        # the identical index sequence -- the pipeline pairs them row for row --
+        # so both run this same nested walk.
+        n_chunks = (n_rows + CHUNK - 1) // CHUNK
+        num_workers_total = gdim * WORKERS
+
+        for w in cutlass.range_constexpr(WORKERS):
+            wid = bidx * WORKERS + w
+            my_chunks = (n_chunks - wid + num_workers_total - 1) // num_workers_total
+            if my_chunks < 0:
+                my_chunks = Int32(0)
+            staged = cute.make_tensor(
+                staged_all.iterator + w * SPW * hidden,
+                cute.make_layout((hidden, SPW)))
+
+            if warp_id == w:
+                # ---- Producer warp: gate, then stage rows into SMEM. ----
+                if lane_id == 0:
+                    prod = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, SPW)
+                    gsem = ExpertArrivalSemaphore(flags=gate_flags)
+                    last_gate = Int32(-1)
+                    for ci in range(my_chunks):
+                        base = (wid + ci * num_workers_total) * CHUNK
+                        hi = base + CHUNK
+                        if hi > n_rows:
+                            hi = n_rows
+                        for idx in range(base, hi):
+                            g = gate_idx[idx]
+                            if g != last_gate:
+                                gsem.poll(g, gate_target)
+                                cute.arch.fence_proxy("async")
+                                last_gate = g
+                            pipes[w].producer_acquire(prod)
+                            s_tile = cute.slice_(staged, (None, prod.index))
+                            g_tile = src_tiled[(None,), send_row[idx]]
+                            cute.copy(g2s_atom, g_tile, s_tile,
+                                      mbar_ptr=pipes[w].producer_get_barrier(prod))
+                            pipes[w].producer_commit(prod)
+                            prod.advance()
+
+            if warp_id == WORKERS + w:
+                # ---- Consumer warp: push staged rows to the peer. ----
+                if lane_id == 0:
+                    cons = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, SPW)
+                    rel = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, SPW)
+                    k = Int32(0)  # rows pushed so far by this worker
+                    for ci in range(my_chunks):
+                        base = (wid + ci * num_workers_total) * CHUNK
+                        hi = base + CHUNK
+                        if hi > n_rows:
+                            hi = n_rows
+                        for idx in range(base, hi):
+                            pipes[w].consumer_wait(cons)
+                            r_ptr = cute.make_ptr(
+                                self.dtype, dst_peer_ptrs[send_dst[idx]],
+                                cute.AddressSpace.gmem, assumed_align=16)
+                            r_flat = cute.make_tensor(
+                                r_ptr, cute.make_layout((dst_rows * hidden,)))
+                            d_tile = cute.zipped_divide(
+                                r_flat, tiler)[(None,), send_slot[idx]]
+                            s_tile = cute.slice_(staged, (None, cons.index))
+                            cute.copy(s2g_atom, s_tile, d_tile)
+                            cute.arch.cp_async_bulk_commit_group()
+                            # Recycle the previous stage once its SMEM read is
+                            # done; remote writes stay in flight.
+                            cute.arch.cp_async_bulk_wait_group(1, read=True)
+                            if k >= 1:
+                                pipes[w].consumer_release(rel)
+                                rel.advance()
+                            cute.arch.cp_async_bulk_wait_group(WWIN)
+                            k += 1
+                            cons.advance()
+                    if k > 0:
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        cute.arch.fence_proxy("async")
+
+
 def make_varlen_all_to_all(dtype, hidden, impl="simt", num_warps=16,
                            num_stages=12, workers=4):
     """Build a varlen all-to-all kernel. `impl="simt"` (default) is the warp

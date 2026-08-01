@@ -553,6 +553,20 @@ class DeviceCommPlan:
                 Int32(num_ctas), rank, world_size, stream,
                 *self._gate(gate_flags, gate_target))
 
+    def push_combine_args(self, src_buf, dst_peer_ptrs, num_ctas, stream,
+                          gate_flags, gate_target):
+        """Args for PushCombineKernel (moe_comm.PushCombineKernel), the
+        dedicated GEMM->combine pusher. It has no Constexpr parameters, so the
+        same list serves cute.compile and the compiled callable. Distinct from
+        args() because that kernel carries no segments and no arrival counter
+        -- it is pure gated data movement."""
+        assert self.gate_idx is not None, "push-combine plan has no gate_idx"
+        return (dyn(src_buf, leading_dim=1, assumed_align=32),
+                from_dlpack(dst_peer_ptrs), dyn(self.src_row),
+                dyn(self.dst_slot), dyn(self.dst_rank), dyn(self.gate_idx),
+                Int32(self.n_rows), Int32(self.dst_rows),
+                dyn(gate_flags), Int32(gate_target), Int32(num_ctas), stream)
+
     def args(self, src_buf, dst_peer_ptrs, flag_peer_ptrs, num_ctas, stream,
              gate_flags=None, gate_target=None):
         """Args for a compiled callable (Constexprs are baked in and omitted)."""

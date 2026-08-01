@@ -44,7 +44,7 @@ import cuda.bindings.driver as cuda_driver
 import nvshmem.core
 
 from tilepipe.moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
-                               make_varlen_all_to_all)
+                               PushCombineKernel)
 
 from quack.gemm import gemm as quack_gemm
 from tilepipe.args import TilePipeArgs
@@ -135,6 +135,14 @@ def run(args):
     flag_pub_local = torch.tensor([tile_flags_local.data_ptr()],
                                   device=device, dtype=torch.int64)
 
+    # The GEMM is launched exactly as upstream apart from the SM cap and the
+    # tile-flag publish. Scheduler tuning (max_swizzle_size) was tried as a
+    # diagnostic and reverted: it moves GEMM time by up to 7% and does NOT
+    # move tile readiness, which is roughly linear in GEMM progress and fully
+    # satisfied by ~60-70% of the way through (the varlen scheduler rasters
+    # per expert, so intra-expert n-grouping only back-loads within one
+    # expert's tiles, ~1/32 of the runtime). Whatever limits the overlap, it
+    # is not the producer's tile order -- so the producer stays untouched.
     def launch_gemm(publish, max_clusters=None, stream=None):
         ptrs = flag_pub_local if publish else None
         with torch.cuda.stream(stream if stream is not None else
@@ -164,21 +172,20 @@ def run(args):
     staging = nvshmem.core.tensor((stage_rows, n), dtype=torch.bfloat16)
     staging.fill_(0)
     stage_peer_ptrs = peer_ptr_tensor(staging, world_size, device)
-    # No arrival counter: the push kernel is pure data movement (flag_peer_ptrs
-    # = None => no segment bookkeeping, no releases). The local reduce is
-    # ordered against PEERS' pushes by the pipeline's existing barrier, not by
-    # an in-band flag — so it runs after that barrier, outside the overlapped
-    # region (it is ~2% of the step).
+    # No arrival counter: PushCombineKernel is pure gated data movement -- no
+    # segments, no releases. The local reduce is ordered against PEERS' pushes
+    # by the pipeline's existing barrier, not by an in-band flag, so it runs
+    # after that barrier, outside the overlapped region (~2% of the step).
     dplan = pplan.to_device(device)
-    push_kernel = make_varlen_all_to_all(
-        cutlass.BFloat16, n, impl=args.comm_impl, num_warps=args.comm_warps,
-        num_stages=args.push_stages, workers=args.push_workers)
-    push_args = lambda ctas, strm: dplan.args(
-        d_buf, stage_peer_ptrs, None, ctas, strm,
+    push_kernel = PushCombineKernel(
+        cutlass.BFloat16, n, num_stages=args.push_stages,
+        workers=args.push_workers, chunk=args.tile_m)
+    push_args = lambda ctas, strm: dplan.push_combine_args(
+        d_buf, stage_peer_ptrs, ctas, strm,
         gate_flags=tile_flags_local, gate_target=n_tiles)
     print(f"[rank {rank}] push-combine: {pplan.n_rows} rows, staging "
           f"{stage_rows * n * 2 / 1e9:.3f} GB")
-    print(f"[rank {rank}] compiling push-combine (gated + ungated)...")
+    print(f"[rank {rank}] compiling push-combine...")
     comm_stream = torch.cuda.Stream(priority=-1)
     gemm_stream = torch.cuda.Stream()
     cs = lambda s: cuda_driver.CUstream(s.cuda_stream)
@@ -186,23 +193,14 @@ def run(args):
     # NOTE cute launches ignore torch.cuda.stream() contexts — the stream is
     # passed explicitly (a default-stream combine under comm_stream events
     # silently measured nothing).
-    push_gated = {c: cute.compile(push_kernel, *dplan.compile_args(
-        d_buf, stage_peer_ptrs, None, c, rank, world_size, cur(),
-        gate_flags=tile_flags_local, gate_target=n_tiles))
-        for c in args.combine_ctas_list}
-    # Ungated twin: the comm cost with no producer coupling at all. This is
-    # the standalone combine number -- what there is to hide, and the comm
-    # half of the speed-of-light bound.
-    push_ungated = {c: cute.compile(push_kernel, *dplan.compile_args(
-        d_buf, stage_peer_ptrs, None, c, rank, world_size, cur()))
-        for c in args.combine_ctas_list}
-    print(f"[rank {rank}] push kernels compiled")
+    # PushCombineKernel has no Constexpr parameters, so one arg list serves
+    # both cute.compile and the compiled callable.
+    push_compiled = {c: cute.compile(push_kernel, *push_args(c, cur()))
+                     for c in args.combine_ctas_list}
+    print(f"[rank {rank}] push kernel compiled")
 
     def launch_push(c, strm):
-        push_gated[c](*push_args(c, cs(strm)))
-
-    def launch_push_ungated(c, strm):
-        push_ungated[c](*dplan.args(d_buf, stage_peer_ptrs, None, c, cs(strm)))
+        push_compiled[c](*push_args(c, cs(strm)))
 
     def launch_reduce(strm):
         # Plain local contraction. CALLER MUST have barriered after the pushes:
@@ -215,6 +213,16 @@ def run(args):
         tile_flags_local.zero_()
         dplan.reset()
         combine_out.zero_()
+        torch.cuda.synchronize()
+        dist.barrier(device_ids=[rank])
+
+    def reset_flags_satisfied():
+        # Reset, then pre-satisfy every gate so no poll ever blocks. Used ONLY
+        # to time the overlapped launch with the stall removed -- the push
+        # then reads rows the GEMM has not written yet, so the output is
+        # garbage by construction. Timing only, never checked.
+        reset()
+        tile_flags_local.fill_(n_tiles)
         torch.cuda.synchronize()
         dist.barrier(device_ids=[rank])
 
@@ -296,20 +304,21 @@ def run(args):
     if not check("serial GEMM->push-combine"):
         raise SystemExit("push-combine serial correctness FAILED")
 
-    # Ungated twin, same expected result: it is the standalone comm number, so
-    # it must be shown to be a like-for-like substitute for the gated kernel
-    # and not merely a faster one. Nothing orders it against the GEMM -- that
-    # is the whole point of the ungated form -- so the producer is fenced with
-    # a full barrier rather than a flag.
+    # Standalone-comm form: same kernel, gate PRE-SATISFIED so no poll blocks.
+    # This is the "push alone" baseline, and it must produce the same answer as
+    # the gated run -- otherwise the baseline is measuring a different kernel.
+    # The producer is fenced with a full barrier here instead of by flags.
     reset()
     launch_gemm(publish=False)
     barrier()
-    launch_push_ungated(c0, comm_stream)
+    tile_flags_local.fill_(n_tiles)
+    barrier()
+    launch_push(c0, comm_stream)
     barrier()
     launch_reduce(comm_stream)
     barrier()
-    if not check("serial GEMM->push-combine (ungated)"):
-        raise SystemExit("ungated push-combine correctness FAILED")
+    if not check("serial GEMM->push-combine (gate pre-satisfied)"):
+        raise SystemExit("pre-satisfied push-combine correctness FAILED")
 
     def overlapped_push(c_ctas):
         # Push kernel first on the high-priority stream: it gates on this
@@ -381,12 +390,12 @@ def run(args):
         lambda: launch_gemm(publish=False, stream=gemm_stream)).total
     t_gemm_pub = time_iters(
         lambda: launch_gemm(publish=True, stream=gemm_stream), pre=reset).total
-    # STANDALONE COMM. The push kernel compiled with no gate at all, so this
-    # is pure transfer cost with no producer coupling -- the single most
-    # important number here: it sets what there is to hide, and it is the
-    # comm half of the speed-of-light bound below.
+    # STANDALONE COMM: the same kernel with the gate pre-satisfied and no GEMM
+    # running, so it is pure transfer cost -- the single most important number
+    # here. It sets what there is to hide and is the comm half of the
+    # speed-of-light bound below.
     t_push_alone = {c: time_iters(
-        lambda: launch_push_ungated(c, comm_stream), pre=reset).total
+        lambda: launch_push(c, comm_stream), pre=reset_flags_satisfied).total
         for c in args.combine_ctas_list}
     # The publishing GEMM restricted to the SMs the overlap leaves it. NOT
     # used for the ideal (that stays speed-of-light, see below) -- this is the
@@ -416,6 +425,15 @@ def run(args):
     ovl = {c: time_iters(lambda: overlapped_push(c), pre=reset)
            for c in args.combine_ctas_list}
     t_push_over = {c: ovl[c].total for c in args.combine_ctas_list}
+    # Same launch, gate PRE-SATISFIED: the two kernels are still co-resident
+    # but the push never blocks. Readiness is measured to be near-linear in
+    # GEMM progress and complete by ~60-70%, so if this is still far above
+    # `push alone` the cost is co-residency (contention / SM starvation), not
+    # waiting -- and removing the gate cannot fix it. Timing only; the push
+    # reads unwritten rows here, so the output is garbage by design.
+    ovl_ready = {c: time_iters(lambda: overlapped_push(c),
+                               pre=reset_flags_satisfied)
+                 for c in args.combine_ctas_list}
 
     # Speed of light: the full-device GEMM against the comm it has to hide.
     # Deliberately NOT max(t_gemm_capped[c], ...) -- we want the absolute
@@ -449,6 +467,16 @@ def run(args):
                   f"{(g / t_gemm_capped[c] - 1) * 100:>+11.1f}% | "
                   f"{p:>10.3f}ms {p - t_push_alone[c]:>+8.3f}ms "
                   f"{(p / t_push_alone[c] - 1) * 100:>+12.1f}%")
+        # Spin-wait vs co-residency. `ready` is the same concurrent launch with
+        # the gate pre-satisfied: whatever separates it from `push alone` is
+        # contention/SM starvation, and whatever separates the gated push from
+        # it is spin waiting.
+        print(f"\n{'ctas':>5} | {'push alone':>11} {'+concurrent GEMM':>18} "
+              f"{'+gate spin':>12} | {'contention':>11} {'spin':>9}")
+        for c in args.combine_ctas_list:
+            base, ready, gated = t_push_alone[c], ovl_ready[c].comm, ovl[c].comm
+            print(f"{c:>5} | {base:>9.3f}ms {ready:>16.3f}ms {gated:>10.3f}ms "
+                  f"| {ready - base:>+9.3f}ms {gated - ready:>+8.3f}ms")
 
     free_symmetric()
     return dict(
@@ -463,6 +491,7 @@ def run(args):
         # Per-stream spans measured inside the overlapped run.
         ovl_gemm_ms={c: ovl[c].gemm for c in args.combine_ctas_list},
         ovl_push_ms={c: ovl[c].comm for c in args.combine_ctas_list},
+        ovl_push_ready_ms={c: ovl_ready[c].comm for c in args.combine_ctas_list},
     )
 
 
@@ -556,15 +585,6 @@ def main():
                              "halves the tile-flag publishes per row")
     parser.add_argument("--combine-ctas", type=str, default="12,24,36,48",
                         help="comma-separated push-combine CTA (= comm SM) counts")
-    parser.add_argument("--comm-impl", choices=["simt", "tma"], default="tma",
-                        help="push-combine backend. Default tma: measured "
-                             "1.2x (N=4096) to 1.7x (N=7168) faster than simt "
-                             "at 8-16 CTAs, which is the regime the SM tax "
-                             "forces the overlap into. They converge on the "
-                             "NVLink roofline above ~24 CTAs, where simt's "
-                             "36-CTA point is actually the better one.")
-    parser.add_argument("--comm-warps", type=int, default=16,
-                        help="[simt] warps per push-combine CTA")
     parser.add_argument("--push-stages", type=int, default=12,
                         help="SMEM stage budget for the push-combine kernel")
     parser.add_argument("--push-workers", type=int, default=4,

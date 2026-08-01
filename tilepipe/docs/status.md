@@ -27,9 +27,41 @@ sweep tokens 2048->16384 and write timestamped results.
 | 48 | 15.3 | 20.4 |
 
 Per-SM efficiency *improves* with batch size; peak aggregate ~1 TB/s at 48
-SMs. TMA backend is ~15% ahead of SIMT at 12-36 SMs for push-combine
-(SIMT is the current default per earlier dispatch-side measurements — the
-dispatch A/B has not been run yet).
+SMs.
+
+**SIMT vs TMA A/B, 4 GPUs, N=hidden=7168, topk=8, 128 experts, 16384
+tokens/rank** (`moe_comm.py --test-push-combine` / `--test-tma-dispatch`,
+`bench_results/{push_combine,tma_dispatch}_4gpu_h7168_topk8_e128_*`):
+
+| CTAs | push simt | push tma | disp simt | disp tma | tma/simt (push) |
+|---|---|---|---|---|---|
+| 8  | 8.550 ms (27.5 /SM) | 6.535 ms (36.0) | 7.724 ms | 4.975 ms | 0.76x |
+| 12 | 5.827 ms (26.9) | **3.424 ms (45.8)** | 5.339 ms | 3.351 ms | **0.59x** |
+| 16 | 4.432 ms (26.5) | 3.808 ms (30.9) | 4.079 ms | 2.871 ms | 0.86x |
+| 24 | 3.086 ms (25.4) | 3.112 ms (25.2) | 2.855 ms | 2.756 ms | 1.01x |
+| 36 | **2.225 ms (23.5)** | 2.490 ms (21.0) | 2.637 ms | 2.409 ms | 1.12x |
+| 48 | 2.597 ms (15.1) | 2.378 ms (16.5) | 2.462 ms | 2.345 ms | 0.92x |
+
+**TMA wins decisively where the overlap actually lives.** At 12 CTAs it is
+1.70x faster for push-combine and 1.59x for dispatch, at 45.8 GB/s per SM
+against SIMT's 26.9. The crossover is ~24 CTAs; above it the two converge on
+the NVLink5 roofline (~790-800 GB/s, ~90% of the ~900 GB/s per-direction
+limit), and SIMT's 36-CTA point (845 GB/s) is the single best push number.
+
+This contradicts the current default. `--comm-impl` defaults to `simt` and
+its help string still claims "faster per SM at TilePipe CTA counts" — true at
+36-48 CTAs, false by 1.6-1.7x at 8-16, which is the regime the SM tax forces
+us into. **Re-default to TMA for the overlapped role** (dispatch and combine
+both) unless the 2-GPU numbers disagree.
+
+Both backends are non-monotonic in CTA count: TMA dips at 16 (3.808 ms, worse
+than 12), SIMT dips at 48 (2.597 ms, worse than 36), reproducibly across all
+four token counts. Same kernel, same CTA counts, different row plans — points
+at segment-to-CTA distribution rather than the transfer engine.
+
+Dispatch and push-combine track each other within 5-11% at >=8192 tokens
+(same `VarlenAllToAllKernel`, same bytes); the gap widens at small sizes
+(1.29x at 2048/8 CTAs), so the residual is fixed per-row plan overhead.
 
 **Fused GEMM -> combine (16384 tokens):**
 
@@ -63,6 +95,8 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
 4. **Latent race in `CombineTmaKernel`** (pre-existing, TODO left in-file):
    1-2 wrong rows out of 1024 at >=1024 tokens, nondeterministic, reproduces
    with static shapes. Likely explains pull's rel_err ~9e-3 vs push's ~3e-3.
+   No longer on the pipeline's critical path (pull was removed), but the
+   kernel is still the standalone/serial combine, so the bug is still live.
 5. **Ratios are measured at N=4096.** The real combine follows the down
    projection (N=hidden=7168) where comm volume is ~1.75x larger against half
    the FLOPs — combine becomes a much bigger fraction. The sweep should be
@@ -74,6 +108,15 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
   (uniform across the GEMM window) rather than per-token (all topk, so
   back-loaded); the gate is local to the producer, so no cross-GPU busy-wait
   and no dependence on world size.
+- **Pull removed from the pipeline entirely** (`gemm_combine.py` is push-only).
+  It lost in *both* roles at 16K/N=4096, not just overlapped: serial 8.53 vs
+  6.81 ms, best overlapped 0.90x vs 1.04x. Removing it also deletes the last
+  cross-rank flag traffic from this benchmark — the symmetric `tile_flags`
+  array, `rank_tile_base`, `flag_idx` and the remote publish pointer table all
+  go; the GEMM now publishes only to its own rank. `CombineTmaKernel` itself
+  stays in `moe_comm.py` as the standalone/serial combine (and its machinery
+  is shared with the TMA dispatch backend), so this is a pipeline decision,
+  not a kernel deletion.
 - **No arrival counter.** The push kernel is pure data movement
   (`flag_peer_ptrs=None` compiles out all segment bookkeeping); the local
   reduce is ordered by the pipeline's existing barrier and measured
@@ -151,17 +194,40 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
    rows should complete early and steadily — but this is unverified.
 5. **Verify the SM partition** actually matches `max_active_clusters`, and
    sweep the low-C regime (8/12/16) where the model predicts a win.
-6. **`LayoutSemaphore` refactor.** Producer publishes at its natural (m,n)
+   `gemm_combine.py` now *measures* the SM tax instead of modelling it: it
+   times the publishing GEMM capped to `num_sms - c` clusters alone and
+   reports it as its own column against the full-device GEMM. `ideal` stays
+   **speed of light** — `max(full-device publishing GEMM, push alone)` — on
+   purpose: we want the bound the approach is aiming at, not one conditioned
+   on whichever SM split we happen to be running. The SM tax is visible
+   beside it rather than folded into it.
+   Caveat: `push alone` runs with the GEMM idle, so it sees full HBM and
+   NVLink; the bound ignores shared-resource contention and is optimistic by
+   construction, which is what a speed-of-light number is for.
+6. **Per-SM timestamp trace** (the real instrument for gate stall). Record the
+   exact nanotime at which each GEMM tile completes and each combine transfer
+   starts — `%%globaltimer` at the publish site and at the gate's exit, one
+   slot per (tile, CTA) in a gmem trace buffer, dumped and aligned after the
+   run. That gives readiness-vs-consumption directly per SM, which is what
+   actually attributes the ~0.9 ms gap in #2 (gate instruction cost vs stall
+   vs SM starvation). Whole-kernel A/Bs cannot separate those; deferred until
+   the SM-tax and low-C sweeps are in.
+7. **`LayoutSemaphore` refactor.** Producer publishes at its natural (m,n)
    tile coordinate (already true); consumers declare their readiness unit as
    a layout, with `target = |fiber of L|`. Retires `n_tiles`-as-an-argument
    and the hand-maintained index spaces that caused three bugs (trickle hang,
    flag_idx mismatch, tail-publish). This is the reuse vehicle for
    **GEMM+allreduce**, whose consumer unit is one (m,n) tile (target 1) and
    which needs *no epilogue change* under this design.
-7. **Pipelined gate**, then re-measure the 12%/6.5% overhead.
-8. Dispatch-side SIMT vs TMA A/B at K=7168 to confirm the default backend.
-9. Fix or retire the `CombineTmaKernel` race (push supersedes it for the
-   overlapped role; it remains the serial/standalone combine).
+8. **Pipelined gate**, then re-measure the 12%/6.5% overhead.
+9. ~~Dispatch-side SIMT vs TMA A/B at K=7168~~ **done** (see Results): TMA
+   is 1.6-1.7x faster at 8-16 CTAs for both dispatch and push-combine, so
+   the `simt` default and its help string are wrong for the overlapped
+   role. Flip `--comm-impl` to `tma` in `gemm_combine.py` and
+   `dispatch_gemm.py` once confirmed at world=2.
+10. Fix or retire the `CombineTmaKernel` race. Pull is out of the pipeline, so
+   this no longer blocks overlap work, but the kernel is still the
+   standalone/serial combine and its machinery backs the TMA dispatch path.
 
 ## Not worth doing (measured or reasoned)
 
