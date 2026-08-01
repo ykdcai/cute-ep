@@ -177,9 +177,18 @@ def run(args):
     # by the pipeline's existing barrier, not by an in-band flag, so it runs
     # after that barrier, outside the overlapped region (~2% of the step).
     dplan = pplan.to_device(device)
+    # CHUNK is the round-robin work unit, deliberately decoupled from tile_m.
+    # The drain tail is one chunk-time (the last chunk is only ready when the
+    # GEMM ends), so it scales as push_alone / chunks_per_worker. At 2048
+    # tokens with tile_m-sized chunks that is 128 chunks over 48 workers = 2.7
+    # each, i.e. a tail worth ~37% of the comm; at 16384 it is 21 each and
+    # ~5%. Smaller chunks shrink the tail without touching transfer size --
+    # rows are still whole contiguous row writes either way. The only cost is
+    # gate polls, which go from ~1 per tile to ~1 per chunk (a satisfied poll
+    # is a single cached load).
     push_kernel = PushCombineKernel(
         cutlass.BFloat16, n, num_stages=args.push_stages,
-        workers=args.push_workers, chunk=args.tile_m)
+        workers=args.push_workers, chunk=args.chunk or args.tile_m)
     push_args = lambda ctas, strm: dplan.push_combine_args(
         d_buf, stage_peer_ptrs, ctas, strm,
         gate_flags=tile_flags_local, gate_target=n_tiles)
@@ -351,147 +360,184 @@ def run(args):
     # Comparing them against the standalone numbers separates "the GEMM got
     # slower from contention" from "the comm ran past the GEMM" -- the wall
     # time alone cannot tell those apart.
+    # PAIRED timing. Every variant is launched once per iteration inside ONE
+    # loop, so within an iteration they all see the same clock and thermal
+    # state; ratios are then formed per-iteration and summarised. Timing each
+    # variant in its own loop (the previous scheme) let the two halves of a
+    # ratio drift minutes apart -- a `serial` measured early read 7.70 ms and
+    # the identical configuration later read 8.26 ms, which alone moved the
+    # 16384 speedup from 1.06x to 1.17x. Paired differences cancel that; no
+    # amount of extra iterations does.
     Timing = namedtuple("Timing", "total comm gemm")
 
-    def time_iters(enqueue, pre=None):
-        # `pre` runs BEFORE the start event, so per-iteration setup (counter
-        # resets, pre-satisfying a gate) never lands inside the timed window.
-        tot, t_c, t_g = [], [], []
+    def _time_once(enqueue, pre):
+        (pre or barrier)()
+        start = torch.cuda.Event(enable_timing=True)
+        end_a = torch.cuda.Event(enable_timing=True)
+        end_b = torch.cuda.Event(enable_timing=True)
+        start.record(comm_stream)
+        gemm_stream.wait_event(start)
+        torch.cuda.current_stream().wait_event(start)
+        enqueue()
+        end_a.record(comm_stream)
+        end_b.record(gemm_stream)
+        torch.cuda.synchronize()
+        return start.elapsed_time(end_a), start.elapsed_time(end_b)
+
+    def time_all(variants):
+        """variants: name -> (enqueue, pre). Returns name -> Timing of arrays,
+        each of shape [iters], already reduced across ranks per iteration (a
+        step costs what the SLOWEST rank costs, so MAX is the step time)."""
+        names = list(variants)
+        arr = np.zeros((3, len(names), args.iters))
         for it in range(args.warmup + args.iters):
-            if pre is not None:
-                pre()
-            else:
-                barrier()
-            start = torch.cuda.Event(enable_timing=True)
-            end_a = torch.cuda.Event(enable_timing=True)
-            end_b = torch.cuda.Event(enable_timing=True)
-            start.record(comm_stream)
-            gemm_stream.wait_event(start)
-            torch.cuda.current_stream().wait_event(start)
-            enqueue()
-            end_a.record(comm_stream)
-            end_b.record(gemm_stream)
-            torch.cuda.synchronize()
-            if it >= args.warmup:
-                a, b = start.elapsed_time(end_a), start.elapsed_time(end_b)
-                tot.append(max(a, b))
-                t_c.append(a)
-                t_g.append(b)
-        med = lambda xs: float(np.median(xs))
-        t = torch.tensor([med(tot), med(t_c), med(t_g)], device=device)
+            for j, k in enumerate(names):
+                enqueue, pre = variants[k]
+                a, b = _time_once(enqueue, pre)
+                if it >= args.warmup:
+                    arr[0, j, it - args.warmup] = max(a, b)
+                    arr[1, j, it - args.warmup] = a
+                    arr[2, j, it - args.warmup] = b
+        t = torch.from_numpy(arr).to(device)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
-        return Timing(*t.tolist())
+        arr = t.cpu().numpy()
+        return {k: Timing(arr[0, j], arr[1, j], arr[2, j])
+                for j, k in enumerate(names)}
+
+    # Robust summaries. The 16th/84th percentiles are the +-1 sigma band for a
+    # normal sample but survive the occasional outlier iteration, which matters
+    # once we start benchmarking skewed expert distributions where the spread
+    # IS the result rather than noise to be averaged away.
+    med = lambda x: float(np.median(x))
+
+    def band(x):
+        return float(np.percentile(x, 16)), float(np.percentile(x, 84))
+
+    def ratio(num, den):
+        """Per-iteration ratio, then median + band. Formed elementwise because
+        num[i] and den[i] were measured in the same iteration."""
+        r = np.asarray(num) / np.asarray(den)
+        return med(r), *band(r)
+
+    def pm(x):
+        """'median +-half-band' for printing a scalar with its spread."""
+        lo, hi = band(x)
+        return f"{med(x):.3f}+-{(hi - lo) / 2:.3f}"
 
     if rank == 0:
-        print("\nbenchmark: pure GEMM / pure push / capped GEMM / serial / overlapped...")
-
-    # --- Each component alone, then the two compositions. ---
-    t_gemm_plain = time_iters(
-        lambda: launch_gemm(publish=False, stream=gemm_stream)).total
-    t_gemm_pub = time_iters(
-        lambda: launch_gemm(publish=True, stream=gemm_stream), pre=reset).total
-    # STANDALONE COMM: the same kernel with the gate pre-satisfied and no GEMM
-    # running, so it is pure transfer cost -- the single most important number
-    # here. It sets what there is to hide and is the comm half of the
-    # speed-of-light bound below.
-    t_push_alone = {c: time_iters(
-        lambda: launch_push(c, comm_stream), pre=reset_flags_satisfied).total
-        for c in args.combine_ctas_list}
-    # The publishing GEMM restricted to the SMs the overlap leaves it. NOT
-    # used for the ideal (that stays speed-of-light, see below) -- this is the
-    # SM tax on its own, measured rather than modelled, and it is what tells
-    # us whether max_active_clusters really frees the SMs we assume.
-    t_gemm_capped = {c: time_iters(
-        lambda: launch_gemm(publish=True, max_clusters=num_sms - c,
-                            stream=gemm_stream), pre=reset).total
-        for c in args.combine_ctas_list}
+        print(f"\nbenchmark: paired timing, {args.iters} iters x "
+              f"{3 + 5 * len(args.combine_ctas_list)} variants per iteration...")
 
     def serial_push(c):
         # Reduce excluded: it needs a cross-rank barrier, so it is measured
-        # separately (t_reduce) and applies equally to serial and overlapped.
+        # separately and applies equally to serial and overlapped.
         launch_gemm(publish=True, stream=comm_stream)
         launch_push(c, comm_stream)
 
-    # Fair serial baseline: each phase gets the whole GPU, so the push runs
-    # with the LARGEST CTA count in the sweep (a small-CTA serial push would
-    # pad the baseline and flatter the overlap numbers).
-    c_serial = max(args.combine_ctas_list)
-    t_push_serial = time_iters(lambda: serial_push(c_serial), pre=reset).total
-    t_reduce = time_iters(lambda: launch_reduce(comm_stream)).total
-    # Keep the full per-stream split here: `ovl[c].gemm` is the GEMM's own
-    # span inside the overlap (vs t_gemm_capped -> contention) and
-    # `ovl[c].comm` is the push's own span (vs t_push_alone -> gate stall +
-    # drain). This is the only run where the two kernels are concurrent.
-    ovl = {c: time_iters(lambda: overlapped_push(c), pre=reset)
-           for c in args.combine_ctas_list}
-    t_push_over = {c: ovl[c].total for c in args.combine_ctas_list}
-    # Same launch, gate PRE-SATISFIED: the two kernels are still co-resident
-    # but the push never blocks. Readiness is measured to be near-linear in
-    # GEMM progress and complete by ~60-70%, so if this is still far above
-    # `push alone` the cost is co-residency (contention / SM starvation), not
-    # waiting -- and removing the gate cannot fix it. Timing only; the push
-    # reads unwritten rows here, so the output is garbage by design.
-    ovl_ready = {c: time_iters(lambda: overlapped_push(c),
-                               pre=reset_flags_satisfied)
-                 for c in args.combine_ctas_list}
+    ctas = args.combine_ctas_list
+    variants = {
+        "gemm_plain": (lambda: launch_gemm(publish=False, stream=gemm_stream), None),
+        "gemm_pub": (lambda: launch_gemm(publish=True, stream=gemm_stream), reset),
+        "reduce": (lambda: launch_reduce(comm_stream), None),
+    }
+    for c in ctas:
+        # STANDALONE COMM: same kernel, gate pre-satisfied, no GEMM running --
+        # pure transfer cost. Sets what there is to hide.
+        variants[f"push_alone_{c}"] = (
+            (lambda c=c: launch_push(c, comm_stream)), reset_flags_satisfied)
+        # The publishing GEMM restricted to the SMs the overlap leaves it: the
+        # SM tax measured rather than modelled.
+        variants[f"gemm_cap_{c}"] = (
+            (lambda c=c: launch_gemm(publish=True, max_clusters=num_sms - c,
+                                     stream=gemm_stream)), reset)
+        # Serial at EVERY CTA count, so the baseline can be picked after the
+        # fact without the choice changing what was measured.
+        variants[f"serial_{c}"] = ((lambda c=c: serial_push(c)), reset)
+        variants[f"ovl_{c}"] = ((lambda c=c: overlapped_push(c)), reset)
+        # Same launch, gate PRE-SATISFIED: co-resident but never blocking, so
+        # the gap to `push_alone` is contention and the gap to `ovl` is spin.
+        # Timing only -- it reads rows the GEMM has not written yet.
+        variants[f"ovl_ready_{c}"] = ((lambda c=c: overlapped_push(c)),
+                                      reset_flags_satisfied)
+    S = time_all(variants)
 
-    # Speed of light: the full-device GEMM against the comm it has to hide.
-    # Deliberately NOT max(t_gemm_capped[c], ...) -- we want the absolute
-    # bound the whole approach is aiming at, not the bound conditioned on the
-    # SM split we happen to be using. The SM tax shows up separately, as the
-    # gap between `gemm@cap` and the full-device GEMM.
-    ideal = {c: max(t_gemm_pub, t_push_alone[c]) for c in args.combine_ctas_list}
+    t_gemm_plain, t_gemm_pub = S["gemm_plain"].total, S["gemm_pub"].total
+    t_reduce = S["reduce"].total
+    t_push_alone = {c: S[f"push_alone_{c}"].total for c in ctas}
+    t_gemm_capped = {c: S[f"gemm_cap_{c}"].total for c in ctas}
+    ovl = {c: S[f"ovl_{c}"] for c in ctas}
+    ovl_ready = {c: S[f"ovl_ready_{c}"] for c in ctas}
+    t_push_over = {c: ovl[c].total for c in ctas}
+    # Fair serial baseline: each phase gets the whole GPU, so the push runs at
+    # the CTA count that is FASTEST standalone -- the hardest baseline to beat,
+    # and independent of which CTA counts happen to be in the sweep list.
+    c_serial = min(ctas, key=lambda c: med(t_push_alone[c]))
+    t_push_serial = S[f"serial_{c_serial}"].total
+    # Speed of light: full-device GEMM against the comm it has to hide.
+    # Deliberately NOT max(gemm@cap, ...) -- the absolute bound the approach is
+    # aiming at, not one conditioned on the SM split in use. Elementwise so it
+    # stays a per-iteration paired quantity.
+    ideal = {c: np.maximum(t_gemm_pub, t_push_alone[c]) for c in ctas}
 
     if rank == 0:
         flops = 2 * total_m * n * k
-        print(f"\npure GEMM   ({num_sms} SMs): {t_gemm_plain:8.3f} ms "
-              f"({flops / t_gemm_plain / 1e9:.0f} TFLOPS); with publish: "
-              f"{t_gemm_pub:8.3f} ms ({(t_gemm_pub / t_gemm_plain - 1) * 100:+.1f}%)")
-        print(f"serial (GEMM then push @{c_serial} CTAs): {t_push_serial:8.3f} ms")
-        print(f"local reduce (after barrier, both paths): {t_reduce:8.3f} ms")
-        print(f"\n{'ctas':>5} {'push alone':>11} {'gemm@cap':>10} {'SMtax%':>7}"
-              f" | {'ideal(SoL)':>11} {'ovl':>9} {'vs ideal':>9} {'vs serial':>10}")
-        for c in args.combine_ctas_list:
-            print(f"{c:>5} {t_push_alone[c]:>9.3f}ms {t_gemm_capped[c]:>8.3f}ms "
-                  f"{(t_gemm_capped[c] / t_gemm_pub - 1) * 100:>6.1f}% | "
-                  f"{ideal[c]:>9.3f}ms {t_push_over[c]:>7.3f}ms "
-                  f"{t_push_over[c] / ideal[c]:>8.2f}x "
-                  f"{t_push_serial / t_push_over[c]:>9.2f}x")
-        # Where the overlap's excess actually goes. Both columns are measured
-        # INSIDE the same overlapped run, against the standalone baselines.
-        print(f"\n{'ctas':>5} | {'gemm in-ovl':>12} {'vs @cap':>8} (contention)"
-              f" | {'push in-ovl':>12} {'vs alone':>9} (stall+drain)")
-        for c in args.combine_ctas_list:
-            g, p = ovl[c].gemm, ovl[c].comm
-            print(f"{c:>5} | {g:>10.3f}ms {g - t_gemm_capped[c]:>+7.3f}ms "
-                  f"{(g / t_gemm_capped[c] - 1) * 100:>+11.1f}% | "
-                  f"{p:>10.3f}ms {p - t_push_alone[c]:>+8.3f}ms "
-                  f"{(p / t_push_alone[c] - 1) * 100:>+12.1f}%")
-        # Spin-wait vs co-residency. `ready` is the same concurrent launch with
-        # the gate pre-satisfied: whatever separates it from `push alone` is
-        # contention/SM starvation, and whatever separates the gated push from
-        # it is spin waiting.
-        print(f"\n{'ctas':>5} | {'push alone':>11} {'+concurrent GEMM':>18} "
-              f"{'+gate spin':>12} | {'contention':>11} {'spin':>9}")
-        for c in args.combine_ctas_list:
-            base, ready, gated = t_push_alone[c], ovl_ready[c].comm, ovl[c].comm
-            print(f"{c:>5} | {base:>9.3f}ms {ready:>16.3f}ms {gated:>10.3f}ms "
-                  f"| {ready - base:>+9.3f}ms {gated - ready:>+8.3f}ms")
+        pct = lambda r: (f"{(r[0] - 1) * 100:+.1f}% "
+                         f"[{(r[1] - 1) * 100:+.1f},{(r[2] - 1) * 100:+.1f}]")
+        xx = lambda r: f"{r[0]:.2f}x [{r[1]:.2f},{r[2]:.2f}]"
+        print(f"\n(median +- half the 16-84 pct band over {args.iters} PAIRED "
+              f"iters; ratios formed per-iteration, so the band is the spread "
+              f"of the ratio itself, not of the two sides separately)")
+        print(f"pure GEMM ({num_sms} SMs): {pm(t_gemm_plain)} ms "
+              f"({flops / med(t_gemm_plain) / 1e9:.0f} TFLOPS)")
+        print(f"  with publish: {pm(t_gemm_pub)} ms  "
+              f"({pct(ratio(t_gemm_pub, t_gemm_plain))})")
+        print(f"serial (GEMM then push @{c_serial} CTAs): {pm(t_push_serial)} ms")
+        print(f"local reduce (excluded from both paths): {pm(t_reduce)} ms")
+        print(f"\n{'ctas':>5} {'push alone':>14} {'gemm@cap':>14} "
+              f"{'SM tax':>22} | {'ovl':>14} {'vs ideal(SoL)':>22} "
+              f"{'vs serial':>22}")
+        for c in ctas:
+            print(f"{c:>5} {pm(t_push_alone[c]):>14} {pm(t_gemm_capped[c]):>14} "
+                  f"{pct(ratio(t_gemm_capped[c], t_gemm_pub)):>22} | "
+                  f"{pm(t_push_over[c]):>14} "
+                  f"{xx(ratio(t_push_over[c], ideal[c])):>22} "
+                  f"{xx(ratio(t_push_serial, t_push_over[c])):>22}")
+        # Where the overlap's excess goes. `ready` is the same concurrent
+        # launch with the gate pre-satisfied, so ready-vs-alone is contention
+        # and gated-vs-ready is spin waiting.
+        print(f"\n{'ctas':>5} | {'gemm in-ovl':>14} {'contention':>20}"
+              f" | {'push alone':>14} {'+GEMM':>14} {'+spin':>14}")
+        for c in ctas:
+            print(f"{c:>5} | {pm(ovl[c].gemm):>14} "
+                  f"{pct(ratio(ovl[c].gemm, t_gemm_capped[c])):>20} | "
+                  f"{pm(t_push_alone[c]):>14} {pm(ovl_ready[c].comm):>14} "
+                  f"{pm(ovl[c].comm):>14}")
 
     free_symmetric()
+    stat = lambda x: dict(med=med(x), lo=band(x)[0], hi=band(x)[1])
+    rstat = lambda a, b: dict(zip(("med", "lo", "hi"), ratio(a, b)))
     return dict(
         tokens=args.tokens, total_m=total_m, K=k, N=n, topk=args.topk,
         experts=args.experts, world=world_size, num_sms=num_sms,
-        gemm_ms=t_gemm_plain, gemm_publish_ms=t_gemm_pub,
-        gemm_tflops=2 * total_m * n * k / t_gemm_plain / 1e9,
-        publish_overhead_pct=(t_gemm_pub / t_gemm_plain - 1) * 100,
-        serial_push_ms=t_push_serial, reduce_ms=t_reduce, serial_ctas=c_serial,
-        push_alone_ms=t_push_alone, gemm_capped_ms=t_gemm_capped, ideal_ms=ideal,
-        push_overlapped_ms={c: t_push_over[c] for c in args.combine_ctas_list},
-        # Per-stream spans measured inside the overlapped run.
-        ovl_gemm_ms={c: ovl[c].gemm for c in args.combine_ctas_list},
-        ovl_push_ms={c: ovl[c].comm for c in args.combine_ctas_list},
-        ovl_push_ready_ms={c: ovl_ready[c].comm for c in args.combine_ctas_list},
+        iters=args.iters, serial_ctas=c_serial,
+        gemm=stat(t_gemm_plain), gemm_publish=stat(t_gemm_pub),
+        gemm_tflops=2 * total_m * n * k / med(t_gemm_plain) / 1e9,
+        publish_overhead=rstat(t_gemm_pub, t_gemm_plain),
+        serial_push=stat(t_push_serial), reduce=stat(t_reduce),
+        push_alone={c: stat(t_push_alone[c]) for c in ctas},
+        gemm_capped={c: stat(t_gemm_capped[c]) for c in ctas},
+        sm_tax={c: rstat(t_gemm_capped[c], t_gemm_pub) for c in ctas},
+        push_overlapped={c: stat(t_push_over[c]) for c in ctas},
+        vs_serial={c: rstat(t_push_serial, t_push_over[c]) for c in ctas},
+        vs_ideal={c: rstat(t_push_over[c], ideal[c]) for c in ctas},
+        ovl_gemm={c: stat(ovl[c].gemm) for c in ctas},
+        ovl_push={c: stat(ovl[c].comm) for c in ctas},
+        ovl_push_ready={c: stat(ovl_ready[c].comm) for c in ctas},
+        # Raw per-iteration samples: paired across variants, so any further
+        # comparison (e.g. skewed vs uniform routing) can be done properly
+        # rather than from medians.
+        samples={k: dict(total=list(v.total), comm=list(v.comm),
+                         gemm=list(v.gemm)) for k, v in S.items()},
     )
 
 
@@ -511,56 +557,59 @@ def write_results(results, args, world_size):
                              for k, v in r.items()} for r in results]},
                   f, indent=2, default=str)
 
+    ms = lambda d: f"{d['med']:.3f}±{(d['hi'] - d['lo']) / 2:.3f}"
+    pc = lambda d: (f"{(d['med'] - 1) * 100:+.1f}% "
+                    f"[{(d['lo'] - 1) * 100:+.1f},{(d['hi'] - 1) * 100:+.1f}]")
+    xx = lambda d: f"{d['med']:.2f}x [{d['lo']:.2f},{d['hi']:.2f}]"
+
     lines = [f"# TilePipe GEMM -> push-combine ({world_size} GPUs)", "",
              f"- generated: {stamp}",
              f"- K={args.hidden} N={args.n} topk={args.topk} "
              f"experts={args.experts} tile={args.tile_m}x{args.tile_n}",
-             f"- comm CTAs swept: {args.combine_ctas_list}", ""]
+             f"- comm CTAs swept: {args.combine_ctas_list}",
+             "- paired timing: every variant launched once per iteration, so "
+             "ratios are formed per-iteration. Values are median ± half the "
+             "16-84 percentile band; bracketed ranges are that band.", ""]
     lines += ["## Summary (best overlapped vs serial)", "",
               "| tokens/rank | GEMM ms | +publish | push alone (best) | "
               "serial push | best ovl | vs serial | vs ideal |",
               "|---|---|---|---|---|---|---|---|"]
     for r in results:
-        bc = min(r["push_alone_ms"].values())
-        best_c = min(r["push_overlapped_ms"], key=r["push_overlapped_ms"].get)
-        bs = r["push_overlapped_ms"][best_c]
+        best_c = min(r["push_overlapped"], key=lambda c: r["push_overlapped"][c]["med"])
+        bc = min(r["push_alone"].values(), key=lambda d: d["med"])
         lines.append(
-            f"| {r['tokens']} | {r['gemm_ms']:.3f} | "
-            f"{r['publish_overhead_pct']:+.1f}% | {bc:.3f} | "
-            f"{r['serial_push_ms']:.3f} | {bs:.3f} (@{best_c}) | "
-            f"{r['serial_push_ms'] / bs:.2f}x | "
-            f"{bs / r['ideal_ms'][best_c]:.2f}x |")
+            f"| {r['tokens']} | {ms(r['gemm'])} | {pc(r['publish_overhead'])} "
+            f"| {ms(bc)} | {ms(r['serial_push'])} "
+            f"| {ms(r['push_overlapped'][best_c])} (@{best_c}) "
+            f"| **{xx(r['vs_serial'][best_c])}** | {xx(r['vs_ideal'][best_c])} |")
     for r in results:
         lines += ["", f"## tokens/rank = {r['tokens']} (total_m={r['total_m']})", "",
-                  f"pure GEMM {r['gemm_ms']:.3f} ms ({r['gemm_tflops']:.0f} TFLOPS); "
-                  f"with publish {r['gemm_publish_ms']:.3f} ms "
-                  f"({r['publish_overhead_pct']:+.1f}%)",
-                  f"serial @{r['serial_ctas']} CTAs {r['serial_push_ms']:.3f} ms; "
-                  f"local reduce {r['reduce_ms']:.3f} ms (excluded from both)", "",
+                  f"pure GEMM {ms(r['gemm'])} ms ({r['gemm_tflops']:.0f} TFLOPS); "
+                  f"with publish {ms(r['gemm_publish'])} ms "
+                  f"({pc(r['publish_overhead'])})",
+                  f"serial @{r['serial_ctas']} CTAs {ms(r['serial_push'])} ms; "
+                  f"local reduce {ms(r['reduce'])} ms (excluded from both)", "",
                   "ideal = speed of light = max(full-device publishing GEMM, "
                   "push alone). The SM tax is reported separately rather than "
                   "folded into the bound.", "",
-                  "| CTAs | push alone | GEMM @cap | SM tax % | ideal (SoL) | "
-                  "overlapped | vs ideal | vs serial |",
-                  "|---|---|---|---|---|---|---|---|"]
-        for c in sorted(r["push_alone_ms"]):
+                  "| CTAs | push alone | GEMM @cap | SM tax | overlapped | "
+                  "vs ideal | vs serial |", "|---|---|---|---|---|---|---|"]
+        for c in sorted(r["push_alone"], key=int):
             lines.append(
-                f"| {c} | {r['push_alone_ms'][c]:.3f} "
-                f"| {r['gemm_capped_ms'][c]:.3f} "
-                f"| {(r['gemm_capped_ms'][c] / r['gemm_publish_ms'] - 1) * 100:+.1f}% "
-                f"| {r['ideal_ms'][c]:.3f} | {r['push_overlapped_ms'][c]:.3f} "
-                f"| {r['push_overlapped_ms'][c] / r['ideal_ms'][c]:.2f}x "
-                f"| {r['serial_push_ms'] / r['push_overlapped_ms'][c]:.2f}x |")
-        lines += ["", "Per-stream spans measured inside the overlapped run: "
-                  "GEMM vs its standalone capped time isolates contention; push "
-                  "vs its standalone time isolates gate stall + drain.", "",
-                  "| CTAs | GEMM in-ovl | vs @cap | push in-ovl | vs alone |",
-                  "|---|---|---|---|---|"]
-        for c in sorted(r["push_alone_ms"]):
-            g, p = r["ovl_gemm_ms"][c], r["ovl_push_ms"][c]
+                f"| {c} | {ms(r['push_alone'][c])} | {ms(r['gemm_capped'][c])} "
+                f"| {pc(r['sm_tax'][c])} | {ms(r['push_overlapped'][c])} "
+                f"| {xx(r['vs_ideal'][c])} | {xx(r['vs_serial'][c])} |")
+        lines += ["", "Per-stream spans inside the overlapped run. `+GEMM` is "
+                  "the push with the gate pre-satisfied but the GEMM running "
+                  "(contention); `+spin` adds the live gate (spin waiting).", "",
+                  "| CTAs | GEMM in-ovl | contention | push alone | +GEMM | "
+                  "+spin |", "|---|---|---|---|---|---|"]
+        for c in sorted(r["push_alone"], key=int):
+            g, cap = r["ovl_gemm"][c], r["gemm_capped"][c]["med"]
+            cont = {kk: g[kk] / cap for kk in ("med", "lo", "hi")}
             lines.append(
-                f"| {c} | {g:.3f} | {(g / r['gemm_capped_ms'][c] - 1) * 100:+.1f}% "
-                f"| {p:.3f} | {(p / r['push_alone_ms'][c] - 1) * 100:+.1f}% |")
+                f"| {c} | {ms(g)} | {pc(cont)} | {ms(r['push_alone'][c])} "
+                f"| {ms(r['ovl_push_ready'][c])} | {ms(r['ovl_push'][c])} |")
     with open(os.path.join(outdir, "results.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\nresults written to {outdir}/ (results.json, results.md)")
@@ -585,6 +634,11 @@ def main():
                              "halves the tile-flag publishes per row")
     parser.add_argument("--combine-ctas", type=str, default="12,24,36,48",
                         help="comma-separated push-combine CTA (= comm SM) counts")
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="rows per round-robin work unit (default tile_m). "
+                             "The drain tail is one chunk-time, so smaller "
+                             "chunks help most at short sequence lengths where "
+                             "there are few chunks per worker.")
     parser.add_argument("--push-stages", type=int, default=12,
                         help="SMEM stage budget for the push-combine kernel")
     parser.add_argument("--push-workers", type=int, default=4,

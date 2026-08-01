@@ -1,7 +1,8 @@
 # TilePipe status: results, problems, next steps
 
-_2026-07-25 · 2 GPUs (B200, 148 SMs), DSv3-ish shapes: K=7168, N=4096,
-topk=8, experts = 32 x world_size. Raw data in `bench_results/`._
+_2026-08-01 · B200 (148 SMs), 2/4/8 GPUs, DSv3-ish shapes: K=7168,
+N=4096, topk=8, experts = 32 x world_size. Raw data in `bench_results/`;
+the current fused numbers are `bench_results/paired{4,8}/`._
 
 ## Where we are
 
@@ -63,44 +64,64 @@ Dispatch and push-combine track each other within 5-11% at >=8192 tokens
 (same `VarlenAllToAllKernel`, same bytes); the gap widens at small sizes
 (1.29x at 2048/8 CTAs), so the residual is fixed per-row plan overhead.
 
-**Fused GEMM -> combine (16384 tokens):**
+**Fused GEMM -> push-combine, PAIRED timing** (`gemm_combine.py`, N=4096
+K=7168 topk=8, 30 iters, median +- half the 16-84 pct band; every variant is
+launched once per iteration so ratios are per-iteration):
 
-```
-pure GEMM (148 SMs)     8.36 ms (922 TFLOPS);  with publish  8.64 ms (+3.3%)
-pure combine            1.61 ms @64 CTAs ... 12.09 ms @8 CTAs
-serial (GEMM then combine)          10.30 ms
-best overlapped (push)              10.69 ms   = 0.96x  (i.e. a loss)
-local reduce (after barrier)         0.15 ms
-```
+| tokens/rank | 4 GPUs (e=128) | 8 GPUs (e=256) |
+|---|---|---|
+| 2048  | 0.95x [0.93,0.97] | 0.93x [0.88,0.94] |
+| 4096  | 1.02x [0.99,1.03] | 1.01x [0.99,1.03] |
+| 8192  | 0.99x [0.96,1.01] | 1.03x [0.97,1.06] |
+| 16384 | **1.07x [1.03,1.10]** | **1.10x [1.07,1.15]** |
 
-Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
+Best CTA count is 8-12 at every size. Overlap is a real win at 16384, a wash
+at 4096-8192, and a loss at 2048; it scales cleanly from 4 to 8 GPUs (the win
+grows because per-rank comm volume grows, giving more to hide). `vs ideal`
+(speed of light) is 1.17-1.30x throughout, so ~20-30% of the bound is still
+unclaimed.
+
+**Publish overhead is zero.** With paired timing it reads +0.6/+0.7/-0.3/-0.6%
+at 4 GPUs and +0.6/+0.1/-1.1/-1.7% at 8. Earlier readings of +3.3% and of
+-5% to +8% were artifacts of timing the two sides in separate loops minutes
+apart; this closes next-step 0.
 
 ## Problems
 
-1. **The SM tax exceeds what we hide.** The GEMM is compute-bound and nearly
-   SM-linear, so donating C SMs costs `8.64 x C/148`. At C=24 that is ~1.4 ms
-   against 1.1-1.8 ms of comm hidden — a wash by construction, independent of
-   any pipeline tuning. Only the low-C regime can win: at C=12 the model
-   predicts ~4% net gain (push 3.37 ms hides inside a 9.4 ms slowed GEMM).
-2. **A ~0.9 ms model-vs-measured gap at low CTA counts.** Measured overlapped
-   is ~0.9 ms worse than `max(slowed GEMM, comm)`. Unresolved; candidates:
-   (a) `max_active_clusters` may not free the SMs we assume, (b) gate stall —
-   the poll is a serialized memory round-trip before each tile's copies,
-   (c) readiness timing (see below).
-3. **Gate overhead is real but not where I predicted.** Pull-combine gated vs
-   ungated: 13.2% @32 CTAs, 6.5% @64. Replacing the polling atomic RMW with
-   `ld.acquire.sys` did **not** help (12.0->13.2%, 4.2->6.5%), so the cost is
-   the serialized latency itself, not exclusive-line acquisition. The
-   pipelined-gate fix (poll tile t+1 while pushing tile t) is untested.
+1. **~~The SM tax exceeds what we hide~~ — wrong, measured.** The GEMM is NOT
+   SM-linear at this shape: donating 24 of 148 SMs (16%) costs 3.6% and
+   donating 36 (24%) costs 10.7%. The old model assumed `8.64 x C/148`. The
+   low-C regime the model pointed at is indeed where the optimum sits (8-12
+   CTAs), but because the tax is cheap there, not because the model was right.
+2. **~~A ~0.9 ms model-vs-measured gap~~ — explained and fixed.** It was the
+   comm kernel's own work partition. `VarlenAllToAllKernel` gives each worker a
+   CONTIGUOUS block of a row list that is in producer order, so worker w only
+   becomes unblocked at ~w/W of the way through the GEMM: the last worker
+   started when the GEMM ended and still had its full share to do, making
+   `overlapped ~= gemm@cap + push_alone` (predicted 9.13 vs 9.13 measured at 16
+   CTAs). Fixed by `PushCombineKernel` with round-robin chunks; moved every
+   size by 8-13 points.
+3. **~~Gate overhead~~ / contention — both ruled out as the limiter.** With the
+   gate PRE-SATISFIED and the GEMM running concurrently, the push costs +1.3%
+   over running alone (at 8 GPUs/16384: +1.9%). The kernels genuinely coexist;
+   the SM split works. Poll frequency is ~43 polls per CTA (one per tile, via
+   `last_gate` caching), not per row.
 4. **Latent race in `CombineTmaKernel`** (pre-existing, TODO left in-file):
    1-2 wrong rows out of 1024 at >=1024 tokens, nondeterministic, reproduces
-   with static shapes. Likely explains pull's rel_err ~9e-3 vs push's ~3e-3.
-   No longer on the pipeline's critical path (pull was removed), but the
-   kernel is still the standalone/serial combine, so the bug is still live.
+   with static shapes. Off the critical path (pull was removed) but still live
+   in the standalone/serial combine.
 5. **Ratios are measured at N=4096.** The real combine follows the down
    projection (N=hidden=7168) where comm volume is ~1.75x larger against half
-   the FLOPs — combine becomes a much bigger fraction. The sweep should be
-   re-run at `--gemm-n 7168` before optimizing against current ratios.
+   the FLOPs. Re-run at `--gemm-n 7168` before optimizing against these.
+6. **The residual is a ~0.2-0.3 ms tail that nothing has moved.** Roughly
+   constant across token counts AND across work-chunk sizes (128 -> 16 rows
+   changed it not at all), which is the signature of a fixed per-worker cost:
+   the terminal `cp_async_bulk_wait_group(0)`, the `WRITE_WINDOW=8` in-flight
+   bound, or the `num_stages` pipeline drain. At 2048 that constant is ~90% of
+   the entire comm, which is exactly why short sequences lose. **This is the
+   whole remaining gap** and it needs the per-SM timestamp trace, not more
+   end-to-end A/Bs -- whole-kernel timing produced three wrong theories in a
+   row here (raster order, contention, chunk quantization).
 
 ## Decisions taken (and why)
 
@@ -117,6 +138,35 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
   stays in `moe_comm.py` as the standalone/serial combine (and its machinery
   is shared with the TMA dispatch backend), so this is a pipeline decision,
   not a kernel deletion.
+- **A dedicated `PushCombineKernel`, not a mode on the shared kernel.** The
+  round-robin partition splits a segment across workers, which dispatch cannot
+  tolerate (it owns segments to publish arrival counters). Push-combine has no
+  arrival counter at all, so the dedicated kernel came out SMALLER than the
+  shared one -- no segments, no `_publish_segment`, no write watermark, and no
+  Constexpr parameters (one arg list serves `cute.compile` and the call).
+  Dispatch stays on `VarlenAllToAllKernel` with contiguous blocks, untouched.
+- **The producer is never modified.** `max_swizzle_size` was tried as a
+  diagnostic and reverted: it moves GEMM time up to 7% and does not move tile
+  readiness at all. Readiness is near-linear in GEMM progress and complete by
+  ~60-70% (measured directly by snapshotting the flag array at intervals with
+  `torch.cuda._sleep` on a second stream). Whatever limits the overlap, it is
+  not producer tile order.
+- **1:1 (per-(m,n)-tile) push rejected on measurement, not principle.** It
+  would drop the gate target from `n_tiles` to 1, but the 16 n-tiles of one
+  m-tile are produced within ~2-4 waves of a ~132-wave GEMM, so it buys ~3%
+  earliness. The cost is real: an output tile's 128 rows go to 128 different
+  token slots on up to W ranks, so at the DESTINATION it is 128 scattered
+  512 B writes rather than one TMA -- 16x more transfers at 1/16 the size,
+  against a push already at ~780 of ~900 GB/s.
+- **Paired timing with error bars.** Every variant is launched once per
+  iteration in one loop and ratios are formed per-iteration. Separate loops let
+  the two halves of a ratio drift minutes apart: an identical `serial` config
+  read 7.70 ms early and 8.26 ms later, which alone moved a reported speedup
+  from 1.06x to 1.17x. Also: `c_serial` is the FASTEST standalone comm config,
+  not `max(combine_ctas_list)` -- tying it to the sweep list meant dropping
+  36/48 from the list silently inflated every ratio. Raw per-iteration samples
+  are kept in results.json for the upcoming expert-skew work, where the spread
+  is the result rather than noise.
 - **No arrival counter.** The push kernel is pure data movement
   (`flag_peer_ptrs=None` compiles out all segment bookkeeping); the local
   reduce is ordered by the pipeline's existing barrier and measured
@@ -130,7 +180,15 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
 
 ## Next steps
 
-0. **Verify the low-overhead publish on the real pipeline** (in flight). The
+0. **Per-SM timestamp trace** — now the top priority, see problem 6. Record
+   `%%globaltimer` at each tile's flag completion and at each worker's push
+   start/end into a gmem trace buffer, dump and align after the run. Shows
+   directly whether the trailing workers wait on data, on their own pipeline
+   drain, or on the write window. Every end-to-end theory tried so far has been
+   wrong; this measures instead of inferring.
+
+1. ~~**Verify the low-overhead publish on the real pipeline**~~ **DONE** — paired
+   timing puts it at +-1% at 4 and 8 GPUs across all sizes (see Results). The
    epilogue publish now emits `red.release.sys` (was `atom`, an RMW returning
    a dead value) over a fully unrolled per-rank loop (the world size is a
    compile-time constant via `tile_flag_world`; it used to be dynamic, which
@@ -142,7 +200,7 @@ Overlap is at best break-even across all sizes (0.75x at 2K -> 0.96x at 16K).
    is no CPU-style ping-pong. What does cost is the *number* of publishes:
    `tile_n=128` doubles the n-tiles and shows a stubborn +13-18%.
    Gate before moving on: overlap runs stay race-free.
-1. **Multi-CTA GEMM is deferred, not rejected** (TODO in `gemm_sm100.py`).
+2. **Multi-CTA GEMM is deferred, not rejected** (TODO in `gemm_sm100.py`).
    `256x256 cluster 2x1` measures 5.32 ms / 1446 TFLOPS vs 5.66 ms / 1360
    for today's `128x256 c1x1` (+6%). Enabling it found a real bug, now
    fixed: cluster-granular scheduling gives overhanging CTAs an out-of-range
