@@ -9,8 +9,9 @@ the current fused numbers are `bench_results/paired{4,8}/`._
 Two pipelines are functionally correct end to end:
 
 - **dispatch -> gated GEMM** (`tilepipe/dispatch_gemm.py`)
-- **GEMM -> combine**, both pull and push variants
-  (`tilepipe/gemm_combine.py`)
+- **GEMM -> push-combine** (`tilepipe/gemm_combine.py`), push only; the pull
+  variant was removed from the pipeline (see Decisions) and survives just as
+  the standalone combine in `moe_comm.py`
 
 Kernel-level tests with their own correctness gates live in `tilepipe/moe_comm.py`
 (`--test-tma-dispatch`, `--test-push-combine`, `--test-tma-combine`); all
@@ -68,18 +69,23 @@ Dispatch and push-combine track each other within 5-11% at >=8192 tokens
 K=7168 topk=8, 30 iters, median +- half the 16-84 pct band; every variant is
 launched once per iteration so ratios are per-iteration):
 
+> **SUPERSEDED at 2048-8192 by the autotune table below.** These were taken
+> with the OLD serial baseline (comm restricted to the overlap's CTA sweep)
+> and with the overlapped figure selected as the best of a ~20-cell sweep.
+> Both were optimistic; see the corrections under the autotune table. Kept
+> here only for the 8-GPU column and the 16384 row, which have not been
+> re-measured against the fixed baseline and should be assumed optimistic by
+> a similar ~5-6 point margin.
+
 | tokens/rank | 4 GPUs (e=128) | 8 GPUs (e=256) |
 |---|---|---|
-| 2048  | 0.95x [0.93,0.97] | 0.93x [0.88,0.94] |
-| 4096  | 1.02x [0.99,1.03] | 1.01x [0.99,1.03] |
-| 8192  | 0.99x [0.96,1.01] | 1.03x [0.97,1.06] |
-| 16384 | **1.07x [1.03,1.10]** | **1.10x [1.07,1.15]** |
+| 2048  | ~~0.95x~~ -> 0.94x | 0.93x [0.88,0.94] |
+| 4096  | ~~1.02x~~ -> 0.99-1.02x | 1.01x [0.99,1.03] |
+| 8192  | ~~0.99x~~ -> 1.02x | 1.03x [0.97,1.06] |
+| 16384 | 1.07x [1.03,1.10] (stale) | 1.10x [1.07,1.15] (stale) |
 
-Best CTA count is 8-12 at every size. Overlap is a real win at 16384, a wash
-at 4096-8192, and a loss at 2048; it scales cleanly from 4 to 8 GPUs (the win
-grows because per-rank comm volume grows, giving more to hide). `vs ideal`
-(speed of light) is 1.17-1.30x throughout, so ~20-30% of the bound is still
-unclaimed.
+Best CTA count is 8-12 at every size. `vs ideal` (speed of light) is 1.20-1.39x
+at 2048-8192, so 20-40% of the bound is still unclaimed.
 
 **Push-kernel autotune (4 GPUs, N=4096, K=7168, topk=8, uniform routing).**
 Config is `workers:stages[:write_window]`; SPW = stages//workers = in-flight
@@ -88,9 +94,50 @@ tokens/rank and clamped to the SMEM the row length allows.
 
 | tokens | config | comm SMs | overlapped | best serial | speedup |
 |---|---|---|---|---|---|
-| 2048  | 2:24 | 12 | 1.169 ms | 1.152 ms | **0.99x** (serial wins) |
-| 4096  | 4:24 |  8 | 1.904 ms | 2.007 ms | **1.05x** |
-| 8192  | 4:24 |  8 | 3.400 ms | 3.659 ms | **1.08x** |
+| 2048  | 2:24 | 12 | 1.195 ms | 1.117 ms | **0.94x** [0.92,0.95] (serial wins) |
+| 4096  | 2:24 | 12 | 1.901 ms | 1.943 ms | **1.02x** [1.01,1.03] |
+| 8192  | 4:24 |  8 | 3.430 ms | 3.522 ms | **1.02x** [0.97,1.04] |
+
+**These supersede an earlier 0.99/1.05/1.08 recorded here**, which was optimistic
+on BOTH sides. Two corrections, verified with the GEMM matching to within 1-2%
+across runs so machine state is excluded:
+
+- *The serial baseline was too slow.* It now runs its comm phase on the FULL
+  device and picks the bandwidth-optimal config, not the overlap's. That is
+  worth 2-3% of the GEMM at every size (`serial/gemm_pub` 1.227 -> 1.188 at
+  2048, 1.248 -> 1.221 at 8192). Outside the overlap there is nothing to donate
+  SMs to, so this is the honest baseline.
+- *The overlapped figure was selection-biased.* It used to be the minimum over
+  ~20 (config, CTA) cells with overlapping bands -- the winner of a noisy
+  competition. It is now the single tuned config, which costs 1-4%
+  (`ovl/gemm_pub` 1.160 -> 1.211 at 4096).
+
+Split of the change: at 2048 it is 73% the serial fix; at 4096-8192 it is
+~63% the unbiased overlap figure. **The overlap is break-even at best in this
+range** -- a loss at 2048, a wash at 4096-8192 with bands touching 1.00. The
+16384 row in the table above has NOT been re-measured against the fixed
+baseline and should be assumed optimistic by a similar margin.
+
+The tuned table is confirmed optimal at 4 GPUs: its entry is the best of 12
+(config, CTA) cells at all three sizes. Margins are small though -- the full
+spread is 5.3%/2.5%/3.4% with bands overlapping -- so any of the 2:24/4:24/2:12
+family is within a couple of percent.
+
+An independent re-run of the tuned defaults (`bench_results/tuned4b`, GPUs 2-5,
+40 iters) reproduces 2048 at **0.94x** and 8192 at **1.02x** exactly, and gives
+4096 at **0.99x** (ovl 1.961 ms vs 1.901 here, serial 1.936 vs 1.943). So 4096
+sits on the boundary: 0.99-1.02x across two runs, i.e. a wash, and the run-to-
+run spread on the overlapped figure (~3%) is the same size as the effect. Do
+not quote 4096 as a win. Two things to know before reading any of these:
+
+- **The serial baseline is not saturating NVLink**, even on the full device:
+  the sanity line reads 348/443/519 GB/s cross-rank at 2048/4096/8192 against
+  a ~900 GB/s NVLink5 roofline. If the baseline's comm can be made faster, all
+  three ratios fall further.
+- **A co-tenant on the box moves these numbers.** The same sweep on GPUs 1-4
+  while two other users were running read 0.83/0.94/1.00 with the GEMM 8-11%
+  slower; on clean GPUs 2-5 it read 0.94/0.99/1.02. Check `nvidia-smi` before
+  trusting a run.
 
 Overlapped times reproduce to within 0.3% across independent runs. What the
 sweep established:
@@ -111,9 +158,13 @@ bandwidth-bound, the overlap is tail-bound, so a faster comm kernel helps the
 baseline more than us: adopting 4:24 cut the 8192 serial from 4.011 to 3.659 ms
 while the overlapped time did not move, taking the ratio from 1.17x to 1.08x.
 The number to track is the absolute overlapped time, with both sides at their
-own best config -- `gemm_combine.py` now picks the serial baseline over the
-whole (config, CTA) grid rather than tying it to the overlap's config. Tying it
-to the primary inflated 8192 from 1.08x to 1.27x in one run.
+own best config -- `gemm_combine.py` now runs the serial baseline's comm on the
+full device at the bandwidth-optimal config rather than tying it to the
+overlap's. Tying it to the overlap's config inflated 8192 to 1.27x in one run,
+and restricting it to the overlap's CTA list inflated it to 1.35x in another.
+Each fix lowered the number; 8192 has gone 1.17x -> 1.08x -> **1.02x** as the
+baseline got honest, with the overlapped time barely moving throughout. Expect
+this to continue: the baseline is still only at ~520 of ~900 GB/s cross-rank.
 
 **Publish overhead is zero.** With paired timing it reads +0.6/+0.7/-0.3/-0.6%
 at 4 GPUs and +0.6/+0.1/-1.1/-1.7% at 8. Earlier readings of +3.3% and of
