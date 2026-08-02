@@ -6,14 +6,12 @@ its token's home rank as soon as the row's tile is produced. Two kernels, two
 streams, disjoint SMs; scoped to one GEMM (in a real SwiGLU MoE layer this
 producer is the down-projection).
 
-PUSH ONLY. The pull combine (gated CombineTmaKernel, each rank fetching its
-own tokens' topk rows from peers) lost in both roles — serial 8.53 vs 6.81 ms
-and best-overlapped 0.90x vs 1.04x at 16K tokens — because readiness is
-per-token (all topk, so back-loaded) rather than per-expert, and the gate is a
-cross-rank busy-wait. It was removed from this pipeline; the kernel itself
-lives on in tilepipe/moe_comm.py as the standalone/serial combine. With pull
-gone this benchmark has NO cross-rank flag traffic: the GEMM publishes only to
-its own rank.
+Push only — the pull combine lost in both roles and was removed (rationale in
+tilepipe/docs/status.md). Consequence worth knowing here: there is NO
+cross-rank flag traffic, the GEMM publishes only to its own rank.
+
+Push-kernel settings come from tilepipe/push_config.py, keyed on tokens/rank;
+--push-config sweeps alternatives as paired variants of the same timing loop.
 
 Inputs are synthetic pre-dispatched activations (A already sits in each
 rank's expert-grouped buffer — dispatch overlap is the other, already-built
@@ -47,6 +45,7 @@ from tilepipe.moe_comm import (torchrun_uid_init_bcast, torchrun_finalize,
                                PushCombineKernel)
 
 from quack.gemm import gemm as quack_gemm
+from tilepipe import push_config
 from tilepipe.args import TilePipeArgs
 from tilepipe.plan import (build_combine_metadata, plan_combine,
                            peer_ptr_tensor)
@@ -85,6 +84,20 @@ def run(args):
     n, k = args.n, args.hidden
     n_tiles = (n + args.tile_n - 1) // args.tile_n
     torch.manual_seed(42 + rank)
+
+    # Resolve the push config for THIS token count: tuned table (keyed on
+    # tokens/rank, stages clamped to the SMEM this N allows), then any explicit
+    # flag overrides, then the extra configs to sweep as paired variants.
+    tuned = push_config.pick(args.tokens, n)
+    prim = (args.push_workers or tuned.workers,
+            args.push_stages or tuned.stages,
+            int(args.write_window) if args.write_window else tuned.wwin)
+    args.cfg_list = [prim] + [c for c in args.cfg_extra if c != prim]
+    for w, st, _ in args.cfg_list:
+        push_config.validate(w, st, n)
+    # Local, NOT written back to args: run() is called once per token size
+    # in a sweep, and the tuned CTA count differs between them.
+    ctas_list = args.combine_ctas_list or [tuned.ctas]
 
     if rank == 0:
         print(f"TilePipe GEMM->combine: tokens/rank={args.tokens} K={k} N={n} "
@@ -136,13 +149,10 @@ def run(args):
                                   device=device, dtype=torch.int64)
 
     # The GEMM is launched exactly as upstream apart from the SM cap and the
-    # tile-flag publish. Scheduler tuning (max_swizzle_size) was tried as a
-    # diagnostic and reverted: it moves GEMM time by up to 7% and does NOT
-    # move tile readiness, which is roughly linear in GEMM progress and fully
-    # satisfied by ~60-70% of the way through (the varlen scheduler rasters
-    # per expert, so intra-expert n-grouping only back-loads within one
-    # expert's tiles, ~1/32 of the runtime). Whatever limits the overlap, it
-    # is not the producer's tile order -- so the producer stays untouched.
+    # tile-flag publish. The producer stays untouched deliberately: tile
+    # readiness is near-linear in GEMM progress and complete by ~60-70%, so
+    # producer tile order is not what limits the overlap (max_swizzle_size was
+    # tried and reverted -- details in status.md).
     def launch_gemm(publish, max_clusters=None, stream=None):
         ptrs = flag_pub_local if publish else None
         with torch.cuda.stream(stream if stream is not None else
@@ -177,18 +187,20 @@ def run(args):
     # by the pipeline's existing barrier, not by an in-band flag, so it runs
     # after that barrier, outside the overlapped region (~2% of the step).
     dplan = pplan.to_device(device)
-    # CHUNK is the round-robin work unit, deliberately decoupled from tile_m.
-    # The drain tail is one chunk-time (the last chunk is only ready when the
-    # GEMM ends), so it scales as push_alone / chunks_per_worker. At 2048
-    # tokens with tile_m-sized chunks that is 128 chunks over 48 workers = 2.7
-    # each, i.e. a tail worth ~37% of the comm; at 16384 it is 21 each and
-    # ~5%. Smaller chunks shrink the tail without touching transfer size --
-    # rows are still whole contiguous row writes either way. The only cost is
-    # gate polls, which go from ~1 per tile to ~1 per chunk (a satisfied poll
-    # is a single cached load).
-    push_kernel = PushCombineKernel(
-        cutlass.BFloat16, n, num_stages=args.push_stages,
-        workers=args.push_workers, chunk=args.chunk or args.tile_m)
+    # `chunk` is INERT: swept at 128/64/32/16 rows and the tail did not move at
+    # any token count, so it stays tied to tile_m. (The idea was that the tail
+    # is one chunk-time; it is not -- see push_config.py for what does matter.)
+    #
+    # One kernel per (workers, stages, write_window) under test, compared as
+    # variants of the SAME paired loop rather than across runs -- cross-run
+    # drift is exactly what corrupts a bandwidth experiment. cfg_list[0] is the
+    # primary: it drives correctness and every non-config measurement. The
+    # serial baseline is NOT tied to it (see below).
+    push_kernels = {cfg: PushCombineKernel(
+        cutlass.BFloat16, n, num_stages=cfg[1], workers=cfg[0],
+        chunk=args.chunk or args.tile_m, write_window=cfg[2])
+        for cfg in args.cfg_list}
+    w0 = args.cfg_list[0]
     push_args = lambda ctas, strm: dplan.push_combine_args(
         d_buf, stage_peer_ptrs, ctas, strm,
         gate_flags=tile_flags_local, gate_target=n_tiles)
@@ -204,12 +216,14 @@ def run(args):
     # silently measured nothing).
     # PushCombineKernel has no Constexpr parameters, so one arg list serves
     # both cute.compile and the compiled callable.
-    push_compiled = {c: cute.compile(push_kernel, *push_args(c, cur()))
-                     for c in args.combine_ctas_list}
-    print(f"[rank {rank}] push kernel compiled")
+    push_compiled = {(cfg, c): cute.compile(push_kernels[cfg], *push_args(c, cur()))
+                     for cfg in args.cfg_list for c in ctas_list}
+    print(f"[rank {rank}] push kernels compiled for "
+          f"{[f'w{a}:s{b}:win{d}' for a, b, d in args.cfg_list]} "
+          f"(primary w{w0[0]}:s{w0[1]}:win{w0[2]})")
 
-    def launch_push(c, strm):
-        push_compiled[c](*push_args(c, cs(strm)))
+    def launch_push(c, strm, w=None):
+        push_compiled[(w if w is not None else w0, c)](*push_args(c, cs(strm)))
 
     def launch_reduce(strm):
         # Plain local contraction. CALLER MUST have barriered after the pushes:
@@ -303,7 +317,7 @@ def run(args):
     # --- Serial correctness. Also the warm-up EXECUTION of every push kernel
     # (lazy module load device-syncs, which deadlocks against a spinning gate,
     # so nothing may reach the overlapped region uninstantiated) ---
-    c0 = args.combine_ctas_list[0]
+    c0 = ctas_list[0]
     reset()
     launch_gemm(publish=True)
     launch_push(c0, comm_stream)
@@ -329,11 +343,11 @@ def run(args):
     if not check("serial GEMM->push-combine (gate pre-satisfied)"):
         raise SystemExit("pre-satisfied push-combine correctness FAILED")
 
-    def overlapped_push(c_ctas):
+    def overlapped_push(c_ctas, w=None):
         # Push kernel first on the high-priority stream: it gates on this
         # rank's own tile counters, so it streams rows out as the GEMM
         # produces them. The reduce follows after the pipeline's barrier.
-        launch_push(c_ctas, comm_stream)
+        launch_push(c_ctas, comm_stream, w)
         launch_gemm(publish=True, max_clusters=num_sms - c_ctas,
                     stream=gemm_stream)
 
@@ -426,15 +440,15 @@ def run(args):
 
     if rank == 0:
         print(f"\nbenchmark: paired timing, {args.iters} iters x "
-              f"{3 + 5 * len(args.combine_ctas_list)} variants per iteration...")
+              f"{3 + 5 * len(ctas_list)} variants per iteration...")
 
-    def serial_push(c):
+    def serial_push(c, w=None):
         # Reduce excluded: it needs a cross-rank barrier, so it is measured
         # separately and applies equally to serial and overlapped.
         launch_gemm(publish=True, stream=comm_stream)
-        launch_push(c, comm_stream)
+        launch_push(c, comm_stream, w)
 
-    ctas = args.combine_ctas_list
+    ctas = ctas_list
     variants = {
         "gemm_plain": (lambda: launch_gemm(publish=False, stream=gemm_stream), None),
         "gemm_pub": (lambda: launch_gemm(publish=True, stream=gemm_stream), reset),
@@ -450,8 +464,13 @@ def run(args):
         variants[f"gemm_cap_{c}"] = (
             (lambda c=c: launch_gemm(publish=True, max_clusters=num_sms - c,
                                      stream=gemm_stream)), reset)
-        # Serial at EVERY CTA count, so the baseline can be picked after the
-        # fact without the choice changing what was measured.
+        # Serial at every (config, CTA), so the baseline is the best the SERIAL
+        # path can do -- not merely the best the primary config can do. Serial
+        # is bandwidth-bound while the overlap is tail-bound, so their optima
+        # differ; tying the baseline to the primary understates it whenever the
+        # primary was chosen for the overlap. Measured: making 2:24 primary
+        # (good for the overlap, slow standalone) inflated the 8192 speedup
+        # from 1.08x to 1.27x purely by slowing the baseline.
         variants[f"serial_{c}"] = ((lambda c=c: serial_push(c)), reset)
         variants[f"ovl_{c}"] = ((lambda c=c: overlapped_push(c)), reset)
         # Same launch, gate PRE-SATISFIED: co-resident but never blocking, so
@@ -459,6 +478,17 @@ def run(args):
         # Timing only -- it reads rows the GEMM has not written yet.
         variants[f"ovl_ready_{c}"] = ((lambda c=c: overlapped_push(c)),
                                       reset_flags_satisfied)
+        # Every non-primary config, in the SAME loop so all comparisons are
+        # paired. Serial is included for the reason above.
+        for cfg in args.cfg_list[1:]:
+            tag = f"w{cfg[0]}s{cfg[1]}win{cfg[2]}"
+            variants[f"push_alone_{tag}_{c}"] = (
+                (lambda c=c, cfg=cfg: launch_push(c, comm_stream, cfg)),
+                reset_flags_satisfied)
+            variants[f"ovl_{tag}_{c}"] = (
+                (lambda c=c, cfg=cfg: overlapped_push(c, cfg)), reset)
+            variants[f"serial_{tag}_{c}"] = (
+                (lambda c=c, cfg=cfg: serial_push(c, cfg)), reset)
     S = time_all(variants)
 
     t_gemm_plain, t_gemm_pub = S["gemm_plain"].total, S["gemm_pub"].total
@@ -468,11 +498,17 @@ def run(args):
     ovl = {c: S[f"ovl_{c}"] for c in ctas}
     ovl_ready = {c: S[f"ovl_ready_{c}"] for c in ctas}
     t_push_over = {c: ovl[c].total for c in ctas}
-    # Fair serial baseline: each phase gets the whole GPU, so the push runs at
-    # the CTA count that is FASTEST standalone -- the hardest baseline to beat,
-    # and independent of which CTA counts happen to be in the sweep list.
-    c_serial = min(ctas, key=lambda c: med(t_push_alone[c]))
-    t_push_serial = S[f"serial_{c_serial}"].total
+    # Fair serial baseline: the best over the WHOLE (config, CTA) grid, since
+    # in the serial path each phase gets the whole GPU and there is no reason
+    # it should be handicapped to the overlap's config.
+    def _serial_key(cfg, c):
+        return (f"serial_{c}" if cfg == w0
+                else f"serial_w{cfg[0]}s{cfg[1]}win{cfg[2]}_{c}")
+
+    cfg_serial, c_serial = min(
+        ((cfg, c) for cfg in args.cfg_list for c in ctas),
+        key=lambda p: med(S[_serial_key(*p)].total))
+    t_push_serial = S[_serial_key(cfg_serial, c_serial)].total
     # Speed of light: full-device GEMM against the comm it has to hide.
     # Deliberately NOT max(gemm@cap, ...) -- the absolute bound the approach is
     # aiming at, not one conditioned on the SM split in use. Elementwise so it
@@ -491,7 +527,8 @@ def run(args):
               f"({flops / med(t_gemm_plain) / 1e9:.0f} TFLOPS)")
         print(f"  with publish: {pm(t_gemm_pub)} ms  "
               f"({pct(ratio(t_gemm_pub, t_gemm_plain))})")
-        print(f"serial (GEMM then push @{c_serial} CTAs): {pm(t_push_serial)} ms")
+        print(f"serial (GEMM then push @{c_serial} CTAs, cfg "
+              f"{cfg_serial[0]}:{cfg_serial[1]}:{cfg_serial[2]}): {pm(t_push_serial)} ms")
         print(f"local reduce (excluded from both paths): {pm(t_reduce)} ms")
         print(f"\n{'ctas':>5} {'push alone':>14} {'gemm@cap':>14} "
               f"{'SM tax':>22} | {'ovl':>14} {'vs ideal(SoL)':>22} "
@@ -512,6 +549,29 @@ def run(args):
                   f"{pct(ratio(ovl[c].gemm, t_gemm_capped[c])):>20} | "
                   f"{pm(t_push_alone[c]):>14} {pm(ovl_ready[c].comm):>14} "
                   f"{pm(ovl[c].comm):>14}")
+        if len(args.cfg_list) > 1:
+            # Paired WRITE_WINDOW comparison. `tail` is the diagnostic: if it
+            # shrinks with the window the tail is concurrency-bound and short
+            # sequences are tunable; if it stays pinned it is a fixed latency
+            # and no amount of tuning will fix them.
+            gb = total_m * n * 2 / 1e9
+            print(f"\n{'ctas':>5} {'w:s:win':>10} {'smem':>7} {'push alone':>14} "
+                  f"{'GB/s':>7} {'vs primary':>18} | {'ovl':>14} {'tail':>9} "
+                  f"{'vs serial':>20}")
+            for c in ctas:
+                for cfg in args.cfg_list:
+                    tag = f"w{cfg[0]}s{cfg[1]}win{cfg[2]}"
+                    pa = (t_push_alone[c] if cfg == w0
+                          else S[f"push_alone_{tag}_{c}"].total)
+                    ot = (t_push_over[c] if cfg == w0
+                          else S[f"ovl_{tag}_{c}"].total)
+                    print(f"{c:>5} {f'{cfg[0]}:{cfg[1]}:{cfg[2]}':>10} "
+                          f"{cfg[1] * n * 2 / 1024:>6.0f}K {pm(pa):>14} "
+                          f"{gb / (med(pa) / 1e3):>7.0f} "
+                          f"{pct(ratio(pa, t_push_alone[c])):>18} | "
+                          f"{pm(ot):>14} "
+                          f"{med(ot) - med(t_gemm_capped[c]):>7.3f}ms "
+                          f"{xx(ratio(t_push_serial, ot)):>20}")
 
     free_symmetric()
     stat = lambda x: dict(med=med(x), lo=band(x)[0], hi=band(x)[1])
@@ -519,7 +579,7 @@ def run(args):
     return dict(
         tokens=args.tokens, total_m=total_m, K=k, N=n, topk=args.topk,
         experts=args.experts, world=world_size, num_sms=num_sms,
-        iters=args.iters, serial_ctas=c_serial,
+        iters=args.iters, serial_ctas=c_serial, serial_cfg=list(cfg_serial),
         gemm=stat(t_gemm_plain), gemm_publish=stat(t_gemm_pub),
         gemm_tflops=2 * total_m * n * k / med(t_gemm_plain) / 1e9,
         publish_overhead=rstat(t_gemm_pub, t_gemm_plain),
@@ -566,7 +626,7 @@ def write_results(results, args, world_size):
              f"- generated: {stamp}",
              f"- K={args.hidden} N={args.n} topk={args.topk} "
              f"experts={args.experts} tile={args.tile_m}x{args.tile_n}",
-             f"- comm CTAs swept: {args.combine_ctas_list}",
+             f"- comm CTAs: {args.combine_ctas_list or 'tuned per token count'}",
              "- paired timing: every variant launched once per iteration, so "
              "ratios are formed per-iteration. Values are median ± half the "
              "16-84 percentile band; bracketed ranges are that band.", ""]
@@ -632,22 +692,39 @@ def main():
     parser.add_argument("--tile-n", type=int, default=256,
                         help="fastest cluster-1x1 config is 128x256; it also "
                              "halves the tile-flag publishes per row")
-    parser.add_argument("--combine-ctas", type=str, default="12,24,36,48",
+    parser.add_argument("--combine-ctas", type=str, default=None,
                         help="comma-separated push-combine CTA (= comm SM) counts")
+    # Push-kernel tunables. Defaults come from tilepipe/push_config.py (keyed
+    # on tokens/rank, clamped to the SMEM the row length allows); these flags
+    # override it, and --push-config adds extra configs to sweep as paired
+    # variants. See push_config.py for what each parameter controls.
     parser.add_argument("--chunk", type=int, default=None,
                         help="rows per round-robin work unit (default tile_m). "
-                             "The drain tail is one chunk-time, so smaller "
-                             "chunks help most at short sequence lengths where "
-                             "there are few chunks per worker.")
-    parser.add_argument("--push-stages", type=int, default=12,
-                        help="SMEM stage budget for the push-combine kernel")
-    parser.add_argument("--push-workers", type=int, default=4,
-                        help="producer/consumer warp pairs per push CTA")
+                             "INERT: swept 128/64/32/16, no effect on the tail.")
+    parser.add_argument("--push-config", type=str, default=None,
+                        help="extra push configs to sweep as paired variants, "
+                             "'workers:stages[:write_window]' comma-separated "
+                             "(e.g. 4:24,2:24). In-flight rows per CTA == "
+                             "stages; SMEM == stages * N * 2 B.")
+    parser.add_argument("--write-window", type=str, default=None,
+                        help="in-flight remote writes per worker. INERT: swept "
+                             "8/16/32 at both stages//workers = 6 and 12, "
+                             "spread <=1.1%% and inside the bands.")
+    parser.add_argument("--push-stages", type=int, default=None,
+                        help="SMEM pipeline depth == in-flight rows per CTA "
+                             "(overrides the tuned table)")
+    parser.add_argument("--push-workers", type=int, default=None,
+                        help="producer/consumer warp pairs per push CTA "
+                             "(overrides the tuned table)")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--no-benchmark", dest="benchmark", action="store_false")
     args = parser.parse_args()
-    args.combine_ctas_list = [int(x) for x in args.combine_ctas.split(",")]
+    args.combine_ctas_list = ([int(x) for x in args.combine_ctas.split(",")]
+                              if args.combine_ctas else None)
+    # Resolved per token count in run(), since the tuned config is keyed on
+    # tokens/rank; here we only collect the overrides and the sweep extras.
+    args.cfg_extra = push_config.parse_specs(args.push_config)
     token_list = ([args.tokens] if args.tokens is not None
                   else [int(x) for x in args.token_sweep.split(",")])
     args.tokens = max(token_list)  # heap must cover the largest run

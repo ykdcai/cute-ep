@@ -81,6 +81,40 @@ grows because per-rank comm volume grows, giving more to hide). `vs ideal`
 (speed of light) is 1.17-1.30x throughout, so ~20-30% of the bound is still
 unclaimed.
 
+**Push-kernel autotune (4 GPUs, N=4096, K=7168, topk=8, uniform routing).**
+Config is `workers:stages[:write_window]`; SPW = stages//workers = in-flight
+rows per worker. Tuned table lives in `tilepipe/push_config.py`, keyed on
+tokens/rank and clamped to the SMEM the row length allows.
+
+| tokens | config | comm SMs | overlapped | best serial | speedup |
+|---|---|---|---|---|---|
+| 2048  | 2:24 | 12 | 1.169 ms | 1.152 ms | **0.99x** (serial wins) |
+| 4096  | 4:24 |  8 | 1.904 ms | 2.007 ms | **1.05x** |
+| 8192  | 4:24 |  8 | 3.400 ms | 3.659 ms | **1.08x** |
+
+Overlapped times reproduce to within 0.3% across independent runs. What the
+sweep established:
+
+- **`stages` is the bandwidth knob** (12 -> 24 is +12-18% on comm alone) but
+  buys almost nothing for the overlap, which is tail-bound not bandwidth-bound.
+- **`workers`: 2-4 only.** 1 cannot sustain the bandwidth (0.67x at 8192/8
+  CTAs); 8 has the worst tail and worst overlap everywhere.
+- **`write_window` is inert** -- 8/16/32 at SPW 6 AND 12, spread <=1.1% and
+  inside the bands. The earlier "it cannot matter because SPW=3" reasoning was
+  right but for an incomplete reason; it does not matter at SPW=12 either.
+- **`chunk` is inert** -- 128/64/32/16 rows, no effect on the tail.
+- **CTA count matters most** and is the only parameter whose optimum moves with
+  token count (12 at 2048-4096, 8 at 8192).
+
+**Improving comm bandwidth LOWERS the measured speedup.** Serial is
+bandwidth-bound, the overlap is tail-bound, so a faster comm kernel helps the
+baseline more than us: adopting 4:24 cut the 8192 serial from 4.011 to 3.659 ms
+while the overlapped time did not move, taking the ratio from 1.17x to 1.08x.
+The number to track is the absolute overlapped time, with both sides at their
+own best config -- `gemm_combine.py` now picks the serial baseline over the
+whole (config, CTA) grid rather than tying it to the overlap's config. Tying it
+to the primary inflated 8192 from 1.08x to 1.27x in one run.
+
 **Publish overhead is zero.** With paired timing it reads +0.6/+0.7/-0.3/-0.6%
 at 4 GPUs and +0.6/+0.1/-1.1/-1.7% at 8. Earlier readings of +3.3% and of
 -5% to +8% were artifacts of timing the two sides in separate loops minutes
@@ -113,15 +147,18 @@ apart; this closes next-step 0.
 5. **Ratios are measured at N=4096.** The real combine follows the down
    projection (N=hidden=7168) where comm volume is ~1.75x larger against half
    the FLOPs. Re-run at `--gemm-n 7168` before optimizing against these.
-6. **The residual is a ~0.2-0.3 ms tail that nothing has moved.** Roughly
-   constant across token counts AND across work-chunk sizes (128 -> 16 rows
-   changed it not at all), which is the signature of a fixed per-worker cost:
-   the terminal `cp_async_bulk_wait_group(0)`, the `WRITE_WINDOW=8` in-flight
-   bound, or the `num_stages` pipeline drain. At 2048 that constant is ~90% of
-   the entire comm, which is exactly why short sequences lose. **This is the
-   whole remaining gap** and it needs the per-SM timestamp trace, not more
-   end-to-end A/Bs -- whole-kernel timing produced three wrong theories in a
-   row here (raster order, contention, chunk quantization).
+6. **The residual is a ~0.2-0.35 ms tail that nothing has moved.** Constant
+   across token counts, work-chunk sizes (128 -> 16 rows), pipeline depth
+   (12 -> 24 stages) and write window (8/16/32, at both stages//workers = 6
+   and 12). Three of the four suspects are now eliminated by measurement; what
+   remains is the terminal per-worker `cp_async_bulk_wait_group(0)` drain,
+   consistent with the tail growing with WORKER COUNT (8 workers has the worst
+   tail and the worst overlap at every size) while being insensitive to
+   bandwidth. At 2048 that constant is ~90% of the entire comm, which is
+   exactly why short sequences lose. **This is the whole remaining gap** and it
+   needs the per-SM timestamp trace, not more end-to-end A/Bs -- whole-kernel
+   timing has produced four wrong theories in a row (raster order, contention,
+   chunk quantization, pipeline depth).
 
 ## Decisions taken (and why)
 

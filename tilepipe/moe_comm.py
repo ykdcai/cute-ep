@@ -1259,15 +1259,25 @@ class PushCombineKernel:
 
     Drive it via tilepipe.plan.plan_combine -> DeviceCommPlan.push_args()."""
 
-    WRITE_WINDOW = 8  # in-flight remote writes per worker
+    # In-flight remote writes per worker. NOT bounded by the stage count: the
+    # consumer recycles a stage on wait_group(1, read=True), which retires only
+    # the SMEM *read*, so a write can still be outstanding after its stage is
+    # reused. Raising this therefore buys concurrency for free -- no extra SMEM,
+    # no extra threads. It matters because at the CTA counts the overlap runs
+    # at, the push is LATENCY-bound rather than bandwidth-bound: per-CTA
+    # throughput is flat at ~27 GB/s from 8 to 24 CTAs (26% of roofline at 8),
+    # and the ceiling on in-flight bytes there (workers x WWIN x row_bytes =
+    # 2.1 MB) is barely above the link's ~1.8 MB bandwidth-delay product.
+    WRITE_WINDOW = 8
 
     def __init__(self, dtype, hidden, num_stages: int = 12, workers: int = 4,
-                 chunk: int = 128):
+                 chunk: int = 128, write_window: int = 8):
         self.dtype = dtype
         self.hidden = hidden
         self.NUM_STAGES = num_stages
         self.WORKERS = workers
         self.CHUNK = chunk
+        self.WRITE_WINDOW = write_window
         assert num_stages % workers == 0, "num_stages must divide by workers"
         assert num_stages // workers >= 2, "each worker needs >=2 stages"
         row_bytes = hidden * dtype.width // 8
