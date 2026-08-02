@@ -196,10 +196,12 @@ def run(args):
     # drift is exactly what corrupts a bandwidth experiment. cfg_list[0] is the
     # primary: it drives correctness and every non-config measurement. The
     # serial baseline is NOT tied to it (see below).
+    all_cfgs = list(dict.fromkeys(
+        list(args.cfg_list) + [push_config.serial_config(n)]))
     push_kernels = {cfg: PushCombineKernel(
         cutlass.BFloat16, n, num_stages=cfg[1], workers=cfg[0],
         chunk=args.chunk or args.tile_m, write_window=cfg[2])
-        for cfg in args.cfg_list}
+        for cfg in all_cfgs}
     w0 = args.cfg_list[0]
     push_args = lambda ctas, strm: dplan.push_combine_args(
         d_buf, stage_peer_ptrs, ctas, strm,
@@ -216,8 +218,12 @@ def run(args):
     # silently measured nothing).
     # PushCombineKernel has no Constexpr parameters, so one arg list serves
     # both cute.compile and the compiled callable.
+    # The serial baseline's CTA count is pinned at NVLink saturation and is
+    # normally NOT in the overlap's sweep list, so it needs compiling too.
+    all_ctas = sorted(set(ctas_list) | {
+        args.serial_ctas or push_config.SERIAL_CTAS or num_sms})
     push_compiled = {(cfg, c): cute.compile(push_kernels[cfg], *push_args(c, cur()))
-                     for cfg in args.cfg_list for c in ctas_list}
+                     for cfg in all_cfgs for c in all_ctas}
     print(f"[rank {rank}] push kernels compiled for "
           f"{[f'w{a}:s{b}:win{d}' for a, b, d in args.cfg_list]} "
           f"(primary w{w0[0]}:s{w0[1]}:win{w0[2]})")
@@ -449,6 +455,18 @@ def run(args):
         launch_push(c, comm_stream, w)
 
     ctas = ctas_list
+    # Outside the overlap there is nothing to donate SMs to, so the serial
+    # baseline's comm gets the FULL device. Only the overlapped path runs on a
+    # reduced CTA count. Its config is likewise not forced to the overlap's:
+    # TUNED optimises for the tail, serial is bandwidth-bound, so the baseline
+    # picks the best of {what the overlap runs} U {the bandwidth optimum}.
+    serial_c = args.serial_ctas or push_config.SERIAL_CTAS or num_sms
+    serial_cfgs = list(dict.fromkeys(
+        list(args.cfg_list) + [push_config.serial_config(n)]))
+
+    def _serial_key(cfg):
+        return f"serial_w{cfg[0]}s{cfg[1]}win{cfg[2]}"
+
     variants = {
         "gemm_plain": (lambda: launch_gemm(publish=False, stream=gemm_stream), None),
         "gemm_pub": (lambda: launch_gemm(publish=True, stream=gemm_stream), reset),
@@ -464,14 +482,6 @@ def run(args):
         variants[f"gemm_cap_{c}"] = (
             (lambda c=c: launch_gemm(publish=True, max_clusters=num_sms - c,
                                      stream=gemm_stream)), reset)
-        # Serial at every (config, CTA), so the baseline is the best the SERIAL
-        # path can do -- not merely the best the primary config can do. Serial
-        # is bandwidth-bound while the overlap is tail-bound, so their optima
-        # differ; tying the baseline to the primary understates it whenever the
-        # primary was chosen for the overlap. Measured: making 2:24 primary
-        # (good for the overlap, slow standalone) inflated the 8192 speedup
-        # from 1.08x to 1.27x purely by slowing the baseline.
-        variants[f"serial_{c}"] = ((lambda c=c: serial_push(c)), reset)
         variants[f"ovl_{c}"] = ((lambda c=c: overlapped_push(c)), reset)
         # Same launch, gate PRE-SATISFIED: co-resident but never blocking, so
         # the gap to `push_alone` is contention and the gap to `ovl` is spin.
@@ -487,8 +497,19 @@ def run(args):
                 reset_flags_satisfied)
             variants[f"ovl_{tag}_{c}"] = (
                 (lambda c=c, cfg=cfg: overlapped_push(c, cfg)), reset)
-            variants[f"serial_{tag}_{c}"] = (
-                (lambda c=c, cfg=cfg: serial_push(c, cfg)), reset)
+    # SERIAL over its OWN (config, CTA) grid, not the overlap's. Serial runs
+    # each phase on the whole GPU, so its comm wants far more CTAs than the
+    # overlap (which is paying an SM tax to donate them). Searching only the
+    # overlap's list handicaps the baseline -- with a single tuned CTA count it
+    # has nothing to search at all, which read as 1.35x instead of ~1.01x at
+    # 8192. Still inside the same paired loop, so serial/ovl stays per-iteration.
+    for cfg in serial_cfgs:
+        variants[_serial_key(cfg)] = (
+            (lambda cfg=cfg: serial_push(serial_c, cfg)), reset)
+    # Comm alone at the same CTA count: the sanity check that the baseline is
+    # actually saturating NVLink rather than being quietly starved.
+    variants["push_alone_serial"] = (
+        (lambda: launch_push(serial_c, comm_stream)), reset_flags_satisfied)
     S = time_all(variants)
 
     t_gemm_plain, t_gemm_pub = S["gemm_plain"].total, S["gemm_pub"].total
@@ -498,17 +519,10 @@ def run(args):
     ovl = {c: S[f"ovl_{c}"] for c in ctas}
     ovl_ready = {c: S[f"ovl_ready_{c}"] for c in ctas}
     t_push_over = {c: ovl[c].total for c in ctas}
-    # Fair serial baseline: the best over the WHOLE (config, CTA) grid, since
-    # in the serial path each phase gets the whole GPU and there is no reason
-    # it should be handicapped to the overlap's config.
-    def _serial_key(cfg, c):
-        return (f"serial_{c}" if cfg == w0
-                else f"serial_w{cfg[0]}s{cfg[1]}win{cfg[2]}_{c}")
-
-    cfg_serial, c_serial = min(
-        ((cfg, c) for cfg in args.cfg_list for c in ctas),
-        key=lambda p: med(S[_serial_key(*p)].total))
-    t_push_serial = S[_serial_key(cfg_serial, c_serial)].total
+    cfg_serial = min(serial_cfgs, key=lambda cfg: med(S[_serial_key(cfg)].total))
+    c_serial = serial_c
+    t_push_serial = S[_serial_key(cfg_serial)].total
+    t_push_serial_comm = S["push_alone_serial"].total
     # Speed of light: full-device GEMM against the comm it has to hide.
     # Deliberately NOT max(gemm@cap, ...) -- the absolute bound the approach is
     # aiming at, not one conditioned on the SM split in use. Elementwise so it
@@ -529,6 +543,19 @@ def run(args):
               f"({pct(ratio(t_gemm_pub, t_gemm_plain))})")
         print(f"serial (GEMM then push @{c_serial} CTAs, cfg "
               f"{cfg_serial[0]}:{cfg_serial[1]}:{cfg_serial[2]}): {pm(t_push_serial)} ms")
+        # SANITY: the baseline is only fair if its comm phase saturates the
+        # link. Rows going to this rank never leave the GPU, so only the
+        # cross-rank figure is comparable to the NVLink roofline (~900 GB/s per
+        # direction on NVLink5; the push plateaus around 790-800). The local
+        # share is 1/W under uniform routing, so the total figure runs well
+        # above the roofline at small world sizes -- read the second number.
+        push_gb = pplan.n_rows * n * 2 / 1e9
+        remote_gb = push_gb * float((pplan.dst_rank != rank).mean())
+        secs = med(t_push_serial_comm) / 1e3
+        print(f"  comm alone @{c_serial} CTAs: {pm(t_push_serial_comm)} ms = "
+              f"{push_gb / secs:.0f} GB/s total, {remote_gb / secs:.0f} GB/s "
+              f"cross-rank ({100 * remote_gb / push_gb:.0f}% remote, "
+              f"{push_gb * 1e3:.0f} MB/rank; NVLink5 roofline ~900)")
         print(f"local reduce (excluded from both paths): {pm(t_reduce)} ms")
         print(f"\n{'ctas':>5} {'push alone':>14} {'gemm@cap':>14} "
               f"{'SM tax':>22} | {'ovl':>14} {'vs ideal(SoL)':>22} "
@@ -584,6 +611,7 @@ def run(args):
         gemm_tflops=2 * total_m * n * k / med(t_gemm_plain) / 1e9,
         publish_overhead=rstat(t_gemm_pub, t_gemm_plain),
         serial_push=stat(t_push_serial), reduce=stat(t_reduce),
+        serial_push_comm=stat(t_push_serial_comm),
         push_alone={c: stat(t_push_alone[c]) for c in ctas},
         gemm_capped={c: stat(t_gemm_capped[c]) for c in ctas},
         sm_tax={c: rstat(t_gemm_capped[c], t_gemm_pub) for c in ctas},
@@ -701,6 +729,11 @@ def main():
     parser.add_argument("--chunk", type=int, default=None,
                         help="rows per round-robin work unit (default tile_m). "
                              "INERT: swept 128/64/32/16, no effect on the tail.")
+    parser.add_argument("--serial-ctas", type=int, default=None,
+                        help="comm CTAs for the SERIAL baseline (default "
+                             "push_config.SERIAL_CTAS). Serial has the whole "
+                             "GPU, so this is pinned at NVLink saturation and "
+                             "is deliberately NOT the overlap's CTA count.")
     parser.add_argument("--push-config", type=str, default=None,
                         help="extra push configs to sweep as paired variants, "
                              "'workers:stages[:write_window]' comma-separated "

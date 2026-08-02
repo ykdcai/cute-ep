@@ -44,6 +44,30 @@ PushConfig = namedtuple("PushConfig", "workers stages wwin ctas")
 # `stages`; pass an explicit budget to pick() to override.
 DEFAULT_SMEM_BUDGET = 227 * 1024
 
+# CTA count for the SERIAL baseline's comm phase. `None` means the FULL device
+# (num_sms): outside the overlap there is nothing to donate SMs to, so the comm
+# kernel should have the whole GPU. Only the overlapped path runs on a reduced
+# CTA count, because only it is paying an SM tax. Using the overlap's CTA count
+# for the baseline handicaps it badly -- at 8192 tokens a serial measured at the
+# overlap's 8 CTAs read 4.854 ms against ~3.4 ms on the full device, inflating
+# the speedup from ~0.98x to 1.35x. Measured: the dedicated PushCombineKernel
+# keeps scaling past the ~36-48 CTA plateau the OLD shared kernel showed --
+# 148 CTAs is 26% faster than 48 (0.331 vs 0.417 ms, 806 vs 641 GB/s at 4096
+# tokens/2 GPUs), so capping the baseline at the old plateau understated it.
+# `gemm_combine.py` prints the achieved GB/s as a sanity check. Compare the
+# CROSS-RANK figure to the ~900 GB/s NVLink5 per-direction roofline; the total
+# figure includes rows that stay on the GPU (1/W of them under uniform
+# routing) and so runs above the roofline at small world sizes.
+SERIAL_CTAS = None
+
+# Extra config the SERIAL baseline is always allowed to consider, on top of
+# whatever the overlap is running. TUNED optimises for the OVERLAP, where the
+# limiter is the tail, and at 2048-4096 that lands on 2:24 -- the slowest config
+# standalone (28-36% behind 4:24). The baseline picks the best of {tuned,
+# this}, so it can never be stuck with a config chosen for a different
+# objective. 4:24 is the measured bandwidth optimum (8:24 ties, worse elsewhere).
+SERIAL_CONFIG = (4, 24, 8)
+
 # tokens/rank -> PushConfig. Lookup takes the entry for the largest key <=
 # tokens, so intermediate and larger sizes fall back to the nearest measured
 # point rather than to a default.
@@ -71,6 +95,13 @@ def pick(tokens, n, dtype_bytes=2, budget=DEFAULT_SMEM_BUDGET, table=TUNED):
     cfg = table[key]
     return cfg._replace(stages=min(cfg.stages, max_stages(
         n, cfg.workers, dtype_bytes, budget)))
+
+
+def serial_config(n, dtype_bytes=2, budget=DEFAULT_SMEM_BUDGET):
+    """Bandwidth-optimal config for the serial baseline, stages clamped to what
+    SMEM allows at this row length. Deliberately independent of `pick()`."""
+    w, st, win = SERIAL_CONFIG
+    return (w, min(st, max_stages(n, w, dtype_bytes, budget)), win)
 
 
 def parse_specs(spec, default_wwin=8):
