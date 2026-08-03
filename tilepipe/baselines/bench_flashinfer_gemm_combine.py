@@ -192,7 +192,15 @@ def run(args, a2a, rank, world_size, device):
         inv[s_i, recv_ids[s_i, i_i].long()] = i_i
         slot = inv[pair_src, pair_tok]
         assert int(slot.min()) >= 0, "dispatch dropped a token this rank owns"
-        return pair_src * T + slot
+        # Return it in D's ROW order, not pair order. slot_flat[i] is the
+        # payload row for pair i, and pair i's expert output lives at
+        # D[pair_row[i]] -- D is expert-grouped, the pairs are grouped by
+        # source rank, and those two orders differ. Scattering by pair_row
+        # here lets pre_reduce index_add_ over D directly; pairing slot_flat
+        # with D positionally folds every expert row into the wrong token.
+        out = torch.empty_like(slot)
+        out[pair_row] = pair_src * T + slot
+        return out
 
     def pre_reduce(payload, slot_flat):
         # A token's rows on THIS rank (up to min(topk, epr) experts) collapse

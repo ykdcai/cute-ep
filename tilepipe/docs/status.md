@@ -171,6 +171,94 @@ at 4 GPUs and +0.6/+0.1/-1.1/-1.7% at 8. Earlier readings of +3.3% and of
 -5% to +8% were artifacts of timing the two sides in separate loops minutes
 apart; this closes next-step 0.
 
+**dispatch -> gated GEMM, 4 GPUs, N=2048 K=hidden=7168, topk=8, 128 experts**
+(`dispatch_gemm.py`, 2026-08-02, 30 iters + 10 warmup, clean box, all 8 GPUs
+idle; raw data in `bench_results/{dispatch_4gpu_simt,dispatch_gemm_4gpu_simt,
+dispatch_4gpu_tma,dispatch_4gpu_tma_lowsm,allsm_simt,allsm_tma_w4s12,
+allsm_tma_w8s16}/`).
+
+*Dispatch alone, 16384 tokens/rank, cross-rank egress GB/s* (= `tokens x topk x
+hidden x 2 x (world-1)/world / t`; the local 1/4 of sends is excluded from the
+bytes but its copy work is still inside `t`, so this is achieved egress, not the
+kernel's total copy rate — that is 4/3 higher):
+
+| comm SMs | 16 | 32 | 48 | 64 | 96 | 128 | 144 |
+|---|---|---|---|---|---|---|---|
+| SIMT | 226 | 302 | 344 | 389 | 479 | 545 | 545 |
+| TMA  | 478 | 588 | 596 | 601 | 594 | 655 | 658 |
+
+**Neither engine reaches useful SM utilisation at high CTA counts.** 96 -> 144
+SMs (1.50x the SMs) buys 1.14x on SIMT and 1.11x on TMA; SIMT is flat 128 -> 144
+(2.586 -> 2.584 ms). TMA is at 90% of its 144-SM throughput by 96 SMs and gains
+0.5% from 128 -> 144. Per-SM efficiency falls from 6.2 to 4.6 GB/s/SM over that
+range, so **cap dispatch at ~96-112 SMs**; the rest is worth more to the GEMM.
+
+The plateau is **not** per-CTA pipeline depth. `--tma-workers 8 --tma-stages 16`
+(double the warps per CTA, 16 vs 12 stages) is within noise of the 4/12 default
+at every SM count — 653 vs 658 GB/s at 144. At 144 SMs TMA moves 878 GB/s of
+*total* copy traffic against 658 GB/s of egress; the missing quarter is the
+`dst == rank` copies, which share the peer-copy path and never touch NVLink.
+That points at an aggregate copy-path limit near ~880 GB/s rather than the
+~900 GB/s link, and makes **taking local tokens off the peer path** (direct
+local copy, or letting the GEMM read those rows in place) the next thing to try.
+Untested — inferred from the two columns.
+
+*Overlap vs serial* (>1.00 = overlap wins; oversub 0 throughout):
+
+| engine | tokens | 16 | 32 | 48 | 64 | 96 | 128 | 144 |
+|---|---|---|---|---|---|---|---|---|
+| SIMT | 4096  | 0.51 | 0.90 | **1.14** | **1.17** | 0.86 | 0.40 | - |
+| SIMT | 8192  | 0.66 | 0.86 | **1.06** | **1.11** | 0.83 | 0.38 | 0.08 |
+| SIMT | 16384 | 0.81 | **1.03** | **1.08** | **1.06** | 0.81 | 0.37 | 0.08 |
+| TMA  | 4096  | 0.83 | 0.93 | 0.90 | 0.82 | 0.64 | 0.33 | - |
+| TMA  | 8192  | 0.86 | 0.90 | 0.87 | 0.80 | 0.65 | 0.31 | 0.07 |
+| TMA  | 16384 | 0.84 | 0.89 | 0.88 | 0.79 | 0.65 | 0.31 | 0.07 |
+
+**Only SIMT at comm_sms 48-64 shows a gain, and the window closes with size:**
+1.17x at 4096, 1.11x at 8192, 1.08x at 16384. Below 48 dispatch is the long
+pole; above ~96 the GEMM is starved and it collapses (0.08x at 144).
+**TMA never wins at any CTA count from 8 to 144** — its shallow optimum is
+20-32 SMs at 0.92x. Oversubscription is negative in every cell (kept for the
+ablation only).
+
+**"Overlap wins" and "fastest config" are different answers at 16384.** SIMT@48
+overlapped is 5.014 ms, a real 1.08x over SIMT serial (5.393) — but TMA serial
+is **4.950 ms** and beats every overlapped configuration measured. TMA's whole
+advantage is being a faster kernel, not overlapping better. At 4096-8192 the
+best absolute is still SIMT overlapped (1.398 / 2.582 ms).
+
+Two things to know before re-running. Run-to-run spread on pure dispatch is
+~3-8% at the same setting (TMA@96 read 2.200 ms in one run and 2.374 in
+another), so single-cell differences under ~8% are not real. And **never put
+`--comm-sms` equal to the SM count**: `run_overlapped` computes
+`max_clusters = min(num_sms, num_sms + oversub - comm_sms)`, so 148 asks the
+GEMM for 0 clusters and `quack_gemm` raises `cudaErrorInvalidValue`. A full-SM
+dispatch run is a *serial*-path measurement; 144 is the top of a valid sweep.
+
+Replicate (each command measures its own serial baseline, so the ratio comes out
+of one run; read the `vs-serial s` column):
+
+```bash
+# SIMT -- the engine that shows the overlap gain
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --no-sync torchrun --nproc-per-node 4 \
+  tilepipe/dispatch_gemm.py \
+  --experts 128 --topk 8 --hidden 7168 --gemm-n 2048 \
+  --token-sweep 4096,8192,16384 \
+  --comm-sms 16,32,48,64,96,128,144 \
+  --iters 30 --warmup 10 --results-dir bench_results/repro_simt
+
+# TMA -- faster alone and in serial, never wins overlapped
+CUDA_VISIBLE_DEVICES=0,1,2,3 uv run --no-sync torchrun --nproc-per-node 4 \
+  tilepipe/dispatch_gemm.py \
+  --experts 128 --topk 8 --hidden 7168 --gemm-n 2048 --copy tma \
+  --token-sweep 4096,8192,16384 \
+  --comm-sms 16,32,48,64,96,128,144 \
+  --iters 30 --warmup 10 --results-dir bench_results/repro_tma
+```
+
+Omit `--oversub-sms` rather than passing `0`: the driver already prepends 0, so
+`--oversub-sms 0` sweeps the base column twice for identical numbers.
+
 ## Problems
 
 1. **~~The SM tax exceeds what we hide~~ — wrong, measured.** The GEMM is NOT
