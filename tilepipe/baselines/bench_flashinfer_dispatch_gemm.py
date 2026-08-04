@@ -43,6 +43,7 @@ from flashinfer.comm.trtllm_moe_alltoall import (
     MoeAlltoAll,
     moe_a2a_get_workspace_size_per_rank,
 )
+from flashinfer.autotuner import autotune
 from flashinfer.grouped_mm import grouped_mm_bf16
 
 from tilepipe.plan import build_combine_metadata
@@ -178,6 +179,15 @@ def run(args, a2a, rank, world_size, device):
             D_ref[lo:hi] = A_ref[lo:hi].float() @ W_e.float().T
             del W_e
     torch.cuda.synchronize()
+
+    # Profile grouped_mm tactics for THIS shape before anything is timed or
+    # checked. Without it the GEMM runs FlashInfer's default tactic (-1), which
+    # measured 783 TFLOPS against quack's 1025 at 2048 tokens -- comparing our
+    # autotuned kernels against an untuned reference is not a fair baseline.
+    # Tactics are cached per shape, so every token count needs its own pass.
+    # All tactics compute the same GEMM, so D is left numerically valid.
+    with autotune(True):
+        grouped_mm_bf16(A, weights, m_indptr, out=D)
 
     barrier()
     recv = do_dispatch()
