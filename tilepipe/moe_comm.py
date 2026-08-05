@@ -45,6 +45,7 @@ from cutlass.cutlass_dsl import Int32
 import cuda.bindings.driver as cuda_driver
 from cuda.core import Device
 
+from tilepipe import push_config
 from tilepipe.plan import dyn
 from tilepipe.sync import ExpertArrivalSemaphore, flag_trickle
 
@@ -2600,12 +2601,19 @@ def write_kernel_results(tag, rows, meta, results_dir="bench_results"):
 
 def run_push_combine(num_tokens, hidden, num_experts, topk,
                     ctas_list, num_stages, workers,
-                    warmup_iterations, iterations, impl="simt", num_warps=16):
-    """Standalone correctness test + CTA-sweep benchmark for the push-combine
-    mode of VarlenAllToAllKernel (reverse dispatch: each rank pushes its expert-
-    GEMM output rows back to each token's home rank). The producing GEMM is
-    emulated by pre-satisfied tile flags, so this measures pure push
-    bandwidth; `hidden` here is the GEMM's N."""
+                    warmup_iterations, iterations, impl="push", num_warps=16,
+                    write_window=8, chunk=128, cfg_list=None, profile=False):
+    """Standalone correctness test + CTA-sweep benchmark for push-combine
+    (reverse dispatch: each rank pushes its expert-GEMM output rows back to
+    each token's home rank). The producing GEMM is emulated by pre-satisfied
+    tile flags, so this measures pure push bandwidth; `hidden` here is N.
+
+    `impl="push"` (default) benchmarks `PushCombineKernel`, the kernel
+    `gemm_combine.py` actually ships: round-robin chunks, no segments, no
+    arrival counter. `impl="simt"/"tma"` benchmark the older shared
+    `VarlenAllToAllKernel` instead -- kept because dispatch still uses it, but
+    its contiguous per-worker partition is NOT what the overlap runs, so do
+    not read those numbers as the combine kernel's."""
     from tilepipe.plan import plan_combine, build_push_combine_arrays
 
     rank = dist.get_rank()
@@ -2613,10 +2621,12 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
     device = torch.cuda.current_device()
     epr = num_experts // world_size
     torch.manual_seed(42 + rank)
+    is_push = impl == "push"
     if rank == 0:
+        cfg = (f"{workers}:{num_stages}:{write_window} chunk={chunk}" if is_push
+               else f"stages={num_stages} workers={workers} warps={num_warps}")
         print(f"\nPush-combine test: tokens/rank={num_tokens} N={hidden} "
-              f"experts={num_experts} topk={topk} impl={impl} "
-              f"(stages={num_stages} workers={workers} warps={num_warps}) "
+              f"experts={num_experts} topk={topk} impl={impl} ({cfg}) "
               f"world={world_size}", flush=True)
 
     topk_indices = torch.randint(
@@ -2660,14 +2670,37 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
     tile_flags = torch.full((local_tiles,), 1 << 20, dtype=torch.int32,
                             device=device)  # producer emulated: always ready
 
-    kern = make_varlen_all_to_all(cutlass.BFloat16, hidden, impl=impl,
-                                  num_warps=num_warps, num_stages=num_stages,
-                                  workers=workers)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = {c: cute.compile(kern, *dplan.compile_args(
-        d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, rank, world_size, stream,
-        gate_flags=tile_flags, gate_target=1)) for c in ctas_list}
-    print(f"[rank {rank}] push-combine kernel compiled ({n_rows} rows)", flush=True)
+    # Configs to sweep. cfg_list[0] is the primary (what the tuned table or the
+    # explicit flags asked for); the rest are extra points. Only impl="push"
+    # takes a config -- the legacy kernels get the single (workers, stages).
+    cfgs = ([(workers, num_stages, write_window)] if not is_push
+            else list(dict.fromkeys(
+                [(workers, num_stages, write_window)] + list(cfg_list or []))))
+    if is_push:
+        for w, st, _ in cfgs:
+            push_config.validate(w, st, hidden)
+        kernels = {cfg: PushCombineKernel(
+            cutlass.BFloat16, hidden, num_stages=cfg[1], workers=cfg[0],
+            chunk=chunk, write_window=cfg[2]) for cfg in cfgs}
+        # No Constexprs, so one arg list serves cute.compile and the call.
+        launch_args = lambda c: dplan.push_combine_args(
+            d_buf, stage_peer_ptrs, c, stream,
+            gate_flags=tile_flags, gate_target=1)
+        compiled = {(cfg, c): cute.compile(kernels[cfg], *launch_args(c))
+                    for cfg in cfgs for c in ctas_list}
+    else:
+        kern = make_varlen_all_to_all(cutlass.BFloat16, hidden, impl=impl,
+                                      num_warps=num_warps,
+                                      num_stages=num_stages, workers=workers)
+        launch_args = lambda c: dplan.args(
+            d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, stream,
+            gate_flags=tile_flags, gate_target=1)
+        compiled = {(cfgs[0], c): cute.compile(kern, *dplan.compile_args(
+            d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, rank, world_size,
+            stream, gate_flags=tile_flags, gate_target=1)) for c in ctas_list}
+    print(f"[rank {rank}] push-combine compiled ({n_rows} rows, impl={impl}, "
+          f"{len(cfgs)} cfg x {len(ctas_list)} ctas)", flush=True)
 
     def reset():
         arrivals.fill_(0)
@@ -2677,13 +2710,9 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
         dist.barrier(device_ids=[rank])
 
     # Correctness (also the warm-up execution): every (token, j) slot filled
-    # with the owning rank's row, and arrivals == tokens * topk.
-    reset()
-    compiled[ctas_list[0]](*dplan.args(
-        d_buf, stage_peer_ptrs, arriv_peer_ptrs, ctas_list[0], stream,
-        gate_flags=tile_flags, gate_target=1))
-    torch.cuda.synchronize()
-    dist.barrier(device_ids=[rank])
+    # with the owning rank's row. Checked for EVERY config -- a config that is
+    # fast but wrong (too deep a pipeline, a bad write window) would otherwise
+    # just look like the winner of the sweep.
     ref = torch.zeros((stage_rows, hidden), dtype=torch.bfloat16, device=device)
     for src in range(world_size):
         r_s, sl_s, d_s, *_ = build_push_combine_arrays(
@@ -2696,45 +2725,102 @@ def run_push_combine(num_tokens, hidden, num_experts, topk,
         assert len(r_s) == rows_per_rank[src]
         ref[dev(sl_s[mine]).long()] = d_src[dev(r_s[mine]).long()]
         del d_src
-    ok_data = torch.equal(staging, ref)
-    ok_arr = int(arrivals.item()) == stage_rows
-    print(f"[rank {rank}] push-combine correctness: "
-          f"data={'OK' if ok_data else 'FAIL'} "
-          f"arrivals={'OK' if ok_arr else f'FAIL {int(arrivals.item())}/{stage_rows}'}",
-          flush=True)
-    ok_t = torch.tensor([ok_data and ok_arr], dtype=torch.int32, device=device)
-    dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
-    if not bool(ok_t.item()):
-        raise SystemExit(f"[rank {rank}] push-combine correctness FAILED")
+    for cfg in cfgs:
+        reset()
+        compiled[(cfg, ctas_list[0])](*launch_args(ctas_list[0]))
+        torch.cuda.synchronize()
+        dist.barrier(device_ids=[rank])
+        ok_data = torch.equal(staging, ref)
+        # PushCombineKernel is pure data movement -- it publishes no arrival
+        # counter (the pipeline orders the reduce with a barrier instead), so
+        # there is nothing to check on that path.
+        ok_arr = True if is_push else int(arrivals.item()) == stage_rows
+        arr_str = ("n/a" if is_push else
+                   ('OK' if ok_arr else f'FAIL {int(arrivals.item())}/{stage_rows}'))
+        print(f"[rank {rank}] correctness {cfg[0]}:{cfg[1]}:{cfg[2]}: "
+              f"data={'OK' if ok_data else 'FAIL'} arrivals={arr_str}", flush=True)
+        ok_t = torch.tensor([ok_data and ok_arr], dtype=torch.int32, device=device)
+        dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
+        if not bool(ok_t.item()):
+            raise SystemExit(f"[rank {rank}] push-combine FAILED at {cfg}")
     del ref
 
     push_bytes = n_rows * hidden * 2
+    # Rows whose home is this rank never leave the GPU, so only the cross-rank
+    # figure is comparable to the NVLink roofline (~900 GB/s per direction on
+    # NVLink5). The total runs above it at small world sizes because 1/W of the
+    # rows are local under uniform routing.
+    remote_frac = float((plan.dst_rank != rank).mean()) if n_rows else 0.0
+
+    if profile:
+        # ONE launch inside the profiler range, everything else outside it, so
+        # `ncu --profile-from-start off` captures exactly one kernel. Safe to
+        # profile despite being multi-rank: the gate is pre-satisfied so the
+        # kernel never spins, it holds no device-side cross-rank sync, and its
+        # only remote effect is idempotent writes -- so ncu's default kernel
+        # replay cannot deadlock a peer or corrupt a result. Peers simply wait
+        # at the host-side barrier in reset() while this rank is replayed.
+        cfg, c = cfgs[0], ctas_list[0]
+        for _ in range(max(warmup_iterations, 3)):
+            reset()
+            compiled[(cfg, c)](*launch_args(c))
+        torch.cuda.synchronize()
+        dist.barrier(device_ids=[rank])
+        print(f"[rank {rank}] profiling ONE launch: {cfg[0]}:{cfg[1]}:{cfg[2]} "
+              f"@{c} CTAs, {push_bytes / 1e6:.0f} MB, "
+              f"{100 * remote_frac:.0f}% cross-rank", flush=True)
+        torch.cuda.cudart().cudaProfilerStart()
+        compiled[(cfg, c)](*launch_args(c))
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        dist.barrier(device_ids=[rank])
+        nvshmem.core.free_tensor(d_buf)
+        nvshmem.core.free_tensor(staging)
+        nvshmem.core.free_tensor(arrivals)
+        return []
     rows_out = []
     if rank == 0:
-        print(f"\npush-combine benchmark ({push_bytes / 1e6:.0f} MB pushed/rank)")
-        print(f"{'ctas':>6} {'time':>10} {'GB/s':>8} {'GB/s/SM':>9}")
+        print(f"\npush-combine benchmark ({push_bytes / 1e6:.0f} MB pushed/rank, "
+              f"{100 * remote_frac:.0f}% cross-rank; NVLink5 roofline ~900 GB/s)")
+        print(f"{'ctas':>6} {'w:s:win':>10} {'smem':>7} {'time':>10} {'GB/s':>8} "
+              f"{'x-rank':>8} {'GB/s/SM':>9}")
+    best = {}
     for c in ctas_list:
-        times = []
-        for it in range(warmup_iterations + iterations):
-            reset()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            compiled[c](*dplan.args(
-                d_buf, stage_peer_ptrs, arriv_peer_ptrs, c, stream,
-                gate_flags=tile_flags, gate_target=1))
-            end.record()
-            torch.cuda.synchronize()
-            if it >= warmup_iterations:
-                times.append(start.elapsed_time(end))
-        t = torch.tensor([float(np.median(times))], device=device)
-        dist.all_reduce(t, op=dist.ReduceOp.MAX)
-        t_ms = t.item()
-        if rank == 0:
-            gbps = push_bytes / t_ms / 1e6
-            print(f"{c:>6} {t_ms:>8.3f}ms {gbps:>8.0f} {gbps / c:>9.1f}", flush=True)
-            rows_out.append(dict(tokens=num_tokens, ctas=c,
-                                 mb=push_bytes / 1e6, time_ms=t_ms, gbps=gbps))
+        for cfg in cfgs:
+            times = []
+            for it in range(warmup_iterations + iterations):
+                reset()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                compiled[(cfg, c)](*launch_args(c))
+                end.record()
+                torch.cuda.synchronize()
+                if it >= warmup_iterations:
+                    times.append(start.elapsed_time(end))
+            t = torch.tensor([float(np.median(times))], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            t_ms = t.item()
+            if rank == 0:
+                gbps = push_bytes / t_ms / 1e6
+                print(f"{c:>6} {f'{cfg[0]}:{cfg[1]}:{cfg[2]}':>10} "
+                      f"{cfg[1] * hidden * 2 / 1024:>6.0f}K {t_ms:>8.3f}ms "
+                      f"{gbps:>8.0f} {gbps * remote_frac:>8.0f} {gbps / c:>9.1f}",
+                      flush=True)
+                if c not in best or t_ms < best[c][0]:
+                    best[c] = (t_ms, cfg)
+                rows_out.append(dict(tokens=num_tokens, ctas=c,
+                                     mb=push_bytes / 1e6, time_ms=t_ms, gbps=gbps,
+                                     gbps_xrank=gbps * remote_frac,
+                                     impl=impl, workers=cfg[0], stages=cfg[1],
+                                     write_window=cfg[2], chunk=chunk))
+    if rank == 0 and len(cfgs) > 1:
+        print(f"\nbest config per CTA count ({num_tokens} tokens/rank):")
+        for c in ctas_list:
+            t_ms, cfg = best[c]
+            print(f"  {c:>4} CTAs -> {cfg[0]}:{cfg[1]}:{cfg[2]} "
+                  f"({t_ms:.3f} ms, {push_bytes / t_ms / 1e6 * remote_frac:.0f} "
+                  f"GB/s cross-rank)", flush=True)
 
     nvshmem.core.free_tensor(d_buf)
     nvshmem.core.free_tensor(staging)
@@ -2970,12 +3056,37 @@ def main():
                     help="Run only the push-combine (reverse dispatch) "
                          "correctness test + CTA sweep, then exit. Uses "
                          "--hidden as the GEMM N.")
-    td.add_argument("--comm-impl", default="simt", choices=["simt", "tma"],
-                    help="[tma-dispatch/push-combine] varlen all-to-all backend. "
-                         "Default simt is HISTORICAL, not best: at 4 GPUs / "
-                         "hidden 7168 tma is 1.6-1.7x faster at 8-16 CTAs (the "
-                         "regime TilePipe overlap runs in); they converge on the "
-                         "NVLink roofline above ~24 CTAs. See docs/status.md.")
+    td.add_argument("--profile", action="store_true",
+                    help="[push-combine] run correctness + warm-up, then wrap "
+                         "exactly ONE launch in cudaProfilerStart/Stop and exit. "
+                         "Pair with `ncu --profile-from-start off` so the report "
+                         "holds one kernel. Uses the first --push-config and the "
+                         "first --dispatch-ctas entry.")
+    td.add_argument("--push-config", default=None,
+                    help="[push-combine] extra configs to sweep alongside the "
+                         "tuned default, 'workers:stages[:write_window]' "
+                         "comma-separated (e.g. 4:24,2:24,4:28). Every config "
+                         "is correctness-checked before it is timed. In-flight "
+                         "rows per CTA == stages; SMEM == stages * N * 2 B "
+                         "against ~227 KB, so N caps the feasible stages.")
+    td.add_argument("--push-write-window", default=8, type=int,
+                    help="[push-combine, impl=push] in-flight remote writes per "
+                         "worker. INERT in every sweep so far (8/16/32).")
+    td.add_argument("--push-chunk", default=128, type=int,
+                    help="[push-combine, impl=push] rows per round-robin work "
+                         "unit. INERT in every sweep so far (128/64/32/16).")
+    td.add_argument("--comm-impl", default="simt", choices=["push", "simt", "tma"],
+                    help="backend. 'push' = PushCombineKernel, the dedicated "
+                         "kernel gemm_combine.py ships: the SAME TMA bulk-async "
+                         "engine as 'tma', with segments removed and the "
+                         "contiguous per-worker partition replaced by "
+                         "round-robin chunks. DEFAULT for --test-push-combine, "
+                         "and the only backend whose numbers describe the "
+                         "overlap. 'simt'/'tma' are the older shared "
+                         "VarlenAllToAllKernel; they stay the default for "
+                         "--test-tma-dispatch, which still uses it. push-vs-tma "
+                         "isolates the partition (same engine); push-vs-simt "
+                         "confounds partition and engine. See docs/status.md.")
     td.add_argument("--comm-warps", default=16, type=int,
                     help="[simt] warps per comm CTA.")
     td.add_argument("--dispatch-tma-workers", default=4, type=int,
@@ -3030,6 +3141,16 @@ def main():
                       else [int(x) for x in args.token_sweep.split(",")])
         fn = run_push_combine if args.test_push_combine else run_tma_dispatch
         tag = "push_combine" if args.test_push_combine else "tma_dispatch"
+        # Push-combine defaults to the DEDICATED PushCombineKernel; dispatch
+        # keeps the shared kernel. --comm-impl still overrides either.
+        impl_explicit = any(a.startswith("--comm-impl") for a in sys.argv)
+        impl = (args.comm_impl if impl_explicit
+                else ("push" if args.test_push_combine else args.comm_impl))
+        # Config defaults come from the same tuned table gemm_combine uses, so
+        # the standalone number is the config the pipeline actually runs.
+        cfg_explicit = any(a.startswith(("--dispatch-tma-stages",
+                                         "--dispatch-tma-workers"))
+                           for a in sys.argv)
         torchrun_uid_init_bcast()
         try:
             rank = dist.get_rank()
@@ -3038,24 +3159,40 @@ def main():
                 if rank == 0:
                     print(f"\n{'=' * 70}\n=== tokens/rank = {tok} ==="
                           f"\n{'=' * 70}", flush=True)
+                stages, workers = args.dispatch_tma_stages, args.dispatch_tma_workers
+                if impl == "push" and not cfg_explicit:
+                    tuned = push_config.pick(tok, args.hidden)
+                    stages, workers = tuned.stages, tuned.workers
                 r = fn(tok, args.hidden, args.num_experts, args.topk,
                        ctas_list=[int(x) for x in args.dispatch_ctas.split(",")],
-                       num_stages=args.dispatch_tma_stages,
-                       workers=args.dispatch_tma_workers,
+                       num_stages=stages, workers=workers,
                        warmup_iterations=args.warmup_iterations,
                        iterations=args.iterations,
-                       impl=args.comm_impl, num_warps=args.comm_warps)
+                       impl=impl, num_warps=args.comm_warps,
+                       **(dict(write_window=args.push_write_window,
+                               chunk=args.push_chunk,
+                               profile=args.profile,
+                               cfg_list=push_config.parse_specs(
+                                   args.push_config, args.push_write_window))
+                          if args.test_push_combine else {}))
                 if r:
                     rows.extend(r)
                 torch.cuda.synchronize()
                 dist.barrier()
             if rank == 0 and rows:
+                # `impl` here is the RESOLVED backend, not args.comm_impl --
+                # it names the output directory, and a push run landing in a
+                # directory labelled simt is exactly the confusion this is
+                # meant to prevent. Per-row workers/stages are in `rows`; the
+                # meta values are only the defaults a sweep started from.
                 write_kernel_results(tag, rows, dict(
                     world=dist.get_world_size(), hidden=args.hidden,
                     topk=args.topk, experts=args.num_experts,
                     stages=args.dispatch_tma_stages,
                     workers=args.dispatch_tma_workers,
-                    impl=args.comm_impl, warps=args.comm_warps,
+                    impl=impl, warps=args.comm_warps,
+                    swept_configs=sorted({(r["workers"], r["stages"])
+                                          for r in rows if "workers" in r}),
                     tokens=token_list), results_dir=args.results_dir)
         finally:
             torch.cuda.synchronize()
